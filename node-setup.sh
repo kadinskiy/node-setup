@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ============================================================
-#  VPN Node Firewall Setup Script
+#  VPN Node Firewall Setup Script (Tailscale edition)
 #  Использование: bash node-setup.sh
 # ============================================================
 
@@ -67,13 +67,54 @@ check_root() {
     fi
 }
 
+# ── Tailscale ─────────────────────────────────────────────────
+
+setup_tailscale() {
+    header "Настройка Tailscale"
+
+    if ! command -v tailscale &>/dev/null; then
+        info "Tailscale не найден — устанавливаем..."
+        curl -fsSL https://tailscale.com/install.sh | sh
+        if ! command -v tailscale &>/dev/null; then
+            error "Не удалось установить Tailscale. Установите вручную и перезапустите скрипт."
+            exit 1
+        fi
+        success "Tailscale установлен"
+    else
+        success "Tailscale уже установлен"
+    fi
+
+    if ! systemctl is-active --quiet tailscaled 2>/dev/null; then
+        systemctl enable tailscaled --now 2>/dev/null
+    fi
+
+    TAILSCALE_IP=$(tailscale ip -4 2>/dev/null)
+
+    if [[ -z "$TAILSCALE_IP" ]]; then
+        info "Нода не авторизована в Tailscale. Запускаем авторизацию..."
+        tailscale up
+        for i in {1..15}; do
+            TAILSCALE_IP=$(tailscale ip -4 2>/dev/null)
+            [[ -n "$TAILSCALE_IP" ]] && break
+            sleep 2
+        done
+    fi
+
+    if [[ -z "$TAILSCALE_IP" ]]; then
+        error "Не удалось получить Tailscale IP. Авторизуйтесь вручную: tailscale up"
+        exit 1
+    fi
+
+    success "Tailscale IP этой ноды: $TAILSCALE_IP"
+}
+
 # ── Сбор данных ──────────────────────────────────────────────
 
 collect_config() {
     header "Настройка ноды — сбор параметров"
 
     while true; do
-        ADMIN_IP=$(ask "Ваш управляющий IP (с которого будет доступ)")
+        ADMIN_IP=$(ask "Tailscale IP вашего управляющего компьютера (Windows)")
         if validate_ip "$ADMIN_IP"; then
             break
         else
@@ -125,14 +166,6 @@ collect_config() {
         fi
     done
 
-    header "Port Knocking для SSH"
-    if ask_yn "Включить port knocking для SSH?"; then
-        USE_KNOCK=true
-        KNOCK_SEQ=$(ask "Последовательность портов через пробел" "7000 8000 9000")
-    else
-        USE_KNOCK=false
-    fi
-
     if ask_yn "Установить и настроить Fail2Ban?" "y"; then
         USE_FAIL2BAN=true
     else
@@ -140,13 +173,12 @@ collect_config() {
     fi
 
     header "Итоговая конфигурация"
-    echo -e "  Управляющий IP : ${GREEN}$ADMIN_IP${NC}"
-    echo -e "  SSH порт       : ${GREEN}$SSH_PORT${NC}"
+    echo -e "  Tailscale IP ноды    : ${GREEN}$TAILSCALE_IP${NC}"
+    echo -e "  Управляющий IP (Win) : ${GREEN}$ADMIN_IP${NC}"
+    echo -e "  SSH порт             : ${GREEN}$SSH_PORT${NC}"
     for i in "${!EXTRA_PORTS[@]}"; do
         echo -e "  Порт           : ${GREEN}${EXTRA_PORTS[$i]}${NC} | IP: ${EXTRA_IPS[$i]:-любой} | ${EXTRA_PROTO[$i]}"
     done
-    echo -e "  Port Knocking  : ${GREEN}$USE_KNOCK${NC}"
-    [[ "$USE_KNOCK" == true ]] && echo -e "  Knock sequence : ${GREEN}$KNOCK_SEQ${NC}"
     echo -e "  Fail2Ban       : ${GREEN}$USE_FAIL2BAN${NC}"
     echo ""
 
@@ -170,7 +202,7 @@ setup_ssh() {
     sed -i "s/^#\?Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
 
     declare -A SSH_OPTS=(
-        ["PermitRootLogin"]="no"
+        ["PermitRootLogin"]="yes"
         ["PasswordAuthentication"]="no"
         ["PubkeyAuthentication"]="yes"
         ["MaxAuthTries"]="3"
@@ -203,14 +235,12 @@ setup_firewall() {
 
     apt-get install -y nftables > /dev/null 2>&1
 
-    # Автооткат на 2 минуты
     if command -v at &>/dev/null; then
         echo "nft flush ruleset" | at now + 2 minutes 2>/dev/null
         ROLLBACK_JOB=$(atq 2>/dev/null | tail -1 | awk '{print $1}')
         warn "Автооткат запланирован на 2 мин. Если всё ок — скрипт отменит сам."
     fi
 
-    # Собираем правила для дополнительных портов
     EXTRA_RULES=""
     for i in "${!EXTRA_PORTS[@]}"; do
         port="${EXTRA_PORTS[$i]}"
@@ -233,27 +263,23 @@ setup_firewall() {
         esac
     done
 
-    if [[ "$USE_KNOCK" == true ]]; then
-        SSH_RULE="# SSH открывается через port knocking (knockd)"
-    else
-        SSH_RULE="ip saddr $ADMIN_IP tcp dport $SSH_PORT accept"
-    fi
-
     cat > /etc/nftables.conf << EOF
 #!/usr/sbin/nft -f
 flush ruleset
-
-define ADMIN_IP = $ADMIN_IP
 
 table inet filter {
     chain input {
         type filter hook input priority 0; policy drop;
 
+        # Loopback и established соединения
         iif "lo" accept
         ct state established,related accept
 
-        # SSH
-        $SSH_RULE
+        # Tailscale интерфейс — полный доступ внутри сети
+        iif "tailscale0" accept
+
+        # SSH только с управляющего Tailscale IP
+        ip saddr $ADMIN_IP tcp dport $SSH_PORT accept
 
 $(echo -e "$EXTRA_RULES")
         drop
@@ -305,52 +331,6 @@ EOF
         || warn "Некоторые параметры sysctl не применились"
 }
 
-# ── Port Knocking ────────────────────────────────────────────
-
-setup_knockd() {
-    header "Настройка Port Knocking"
-
-    apt-get install -y knockd > /dev/null 2>&1
-
-    read -ra KNOCK_PORTS <<< "$KNOCK_SEQ"
-    OPEN_SEQ=$(IFS=','; echo "${KNOCK_PORTS[*]}")
-    CLOSE_PORTS=()
-    for (( i=${#KNOCK_PORTS[@]}-1; i>=0; i-- )); do
-        CLOSE_PORTS+=("${KNOCK_PORTS[$i]}")
-    done
-    CLOSE_SEQ=$(IFS=','; echo "${CLOSE_PORTS[*]}")
-
-    cat > /etc/knockd.conf << EOF
-[options]
-    UseSyslog
-
-[openSSH]
-    sequence    = $OPEN_SEQ
-    seq_timeout = 5
-    command     = /sbin/nft add rule inet filter input ip saddr %IP% tcp dport $SSH_PORT accept
-    tcpflags    = syn
-
-[closeSSH]
-    sequence    = $CLOSE_SEQ
-    seq_timeout = 5
-    command     = /sbin/iptables -D INPUT -s %IP% -p tcp --dport $SSH_PORT -j ACCEPT
-    tcpflags    = syn
-EOF
-
-    IFACE=$(ip route 2>/dev/null | grep default | awk '{print $5}' | head -1)
-    if [[ -f /etc/default/knockd ]]; then
-        sed -i "s/^START_KNOCKD=.*/START_KNOCKD=1/" /etc/default/knockd
-        sed -i "s|^KNOCKD_OPTS=.*|KNOCKD_OPTS=\"-i $IFACE\"|" /etc/default/knockd
-    fi
-
-    systemctl enable knockd --now 2>/dev/null && success "knockd запущен" \
-        || warn "knockd не запустился, проверьте: systemctl status knockd"
-
-    echo ""
-    info "Для подключения с Windows — knock.ps1:"
-    echo -e "  ${CYAN}knock <IP> ${KNOCK_PORTS[*]} && ssh -p $SSH_PORT user@<IP>${NC}"
-}
-
 # ── Fail2Ban ─────────────────────────────────────────────────
 
 setup_fail2ban() {
@@ -378,27 +358,29 @@ EOF
 print_summary() {
     header "Готово!"
 
-    echo -e "  ${GREEN}✔${NC} SSH порт       : $SSH_PORT"
-    echo -e "  ${GREEN}✔${NC} Управляющий IP : $ADMIN_IP"
+    echo -e "  ${GREEN}✔${NC} Tailscale IP ноды    : $TAILSCALE_IP"
+    echo -e "  ${GREEN}✔${NC} Управляющий IP (Win) : $ADMIN_IP"
+    echo -e "  ${GREEN}✔${NC} SSH порт             : $SSH_PORT"
     for i in "${!EXTRA_PORTS[@]}"; do
         echo -e "  ${GREEN}✔${NC} Открытый порт : ${EXTRA_PORTS[$i]} | IP: ${EXTRA_IPS[$i]:-любой} | ${EXTRA_PROTO[$i]}"
     done
-    [[ "$USE_KNOCK" == true ]] && echo -e "  ${GREEN}✔${NC} Port knocking  : $KNOCK_SEQ"
     [[ "$USE_FAIL2BAN" == true ]] && echo -e "  ${GREEN}✔${NC} Fail2Ban       : активен"
     echo ""
-    warn "Бэкапы сохранены: /etc/ssh/sshd_config.bak | /etc/sysctl.conf.bak"
+    echo -e "  ${CYAN}Подключение в Termius:${NC}"
+    echo -e "  Host: ${GREEN}$TAILSCALE_IP${NC}  |  Port: ${GREEN}$SSH_PORT${NC}"
     echo ""
+    warn "Бэкапы сохранены: /etc/ssh/sshd_config.bak | /etc/sysctl.conf.bak"
 }
 
 # ── Main ─────────────────────────────────────────────────────
 
 main() {
     check_root
+    setup_tailscale
     collect_config
     setup_ssh
     setup_firewall
     setup_sysctl
-    [[ "$USE_KNOCK" == true ]]    && setup_knockd
     [[ "$USE_FAIL2BAN" == true ]] && setup_fail2ban
     print_summary
 }
