@@ -454,6 +454,9 @@ setup_ssh() {
 
     cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
 
+    # Создаём директорию для privilege separation (нужна для sshd -t)
+    mkdir -p /run/sshd
+
     sshd_set() {
         local key="$1" val="$2"
         sed -i "/^[[:space:]]*#\?[[:space:]]*${key}[[:space:]]/d" /etc/ssh/sshd_config
