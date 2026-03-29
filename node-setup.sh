@@ -727,7 +727,7 @@ print_summary() {
     done
     [[ "$USE_FAIL2BAN"     == true ]] && echo -e "  ${GREEN}✔${NC} Fail2Ban      : активен"
     [[ "$INSTALL_DOCKER"   == true ]] && echo -e "  ${GREEN}✔${NC} Docker        : установлен"
-    [[ "$INSTALL_REMNAWAVE"== true ]] && echo -e "  ${GREEN}✔${NC} Remnawave     : запущен"
+    [[ "$INSTALL_REMNAWAVE" == true ]] && echo -e "  ${GREEN}✔${NC} Remnawave     : запущен"
     [[ -n "$SSH_PUBKEY" ]] \
         && echo -e "  ${GREEN}✔${NC} SSH ключ      : добавлен" \
         || echo -e "  ${RED}✘${NC} SSH ключ      : НЕ ДОБАВЛЕН"
