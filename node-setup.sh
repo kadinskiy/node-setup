@@ -326,15 +326,15 @@ setup_tailscale() {
 
     if [[ -z "$TAILSCALE_IP" ]]; then
         info "Нода не авторизована — запускаем авторизацию..."
-        tailscale up --shields-up
+        tailscale up
         for i in {1..15}; do
             TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || true)
             if [[ -n "$TAILSCALE_IP" ]]; then break; fi
             sleep 2
         done
-    else
-        tailscale set --shields-up 2>/dev/null || true
     fi
+    # shields-up НЕ используем — он блокирует входящий SSH через Tailscale
+    tailscale set --shields-up=false 2>/dev/null || true
 
     if [[ -z "$TAILSCALE_IP" ]]; then
         error "Не удалось получить Tailscale IP."
@@ -692,6 +692,9 @@ net.ipv4.tcp_timestamps = 0
 net.ipv4.conf.all.log_martians = 0
 net.ipv4.conf.default.log_martians = 0
 net.core.somaxconn = 1024
+# BBR — улучшение пропускной способности для VPN-клиентов
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
 EOF
 
     sysctl -p > /dev/null 2>&1 && success "sysctl применён" || warn "Часть параметров не применилась"
@@ -729,8 +732,21 @@ setup_docker() {
     if command -v docker &>/dev/null; then
         success "Docker уже установлен ($(docker --version 2>/dev/null || true))"
     else
+        info "Ждём освобождения apt-блокировки..."
+        local waited=0
+        while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock &>/dev/null 2>&1; do
+            sleep 2
+            waited=$((waited + 2))
+            if [[ $waited -ge 120 ]]; then
+                warn "apt занят больше 2 минут — снимаем блокировку принудительно"
+                rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock
+                dpkg --configure -a 2>/dev/null || true
+                break
+            fi
+            info "apt занят (${waited}с)..."
+        done
+
         info "Устанавливаем Docker..."
-        # Отключаем pipefail на время установки — curl|sh может вернуть ненулевой код
         set +e
         curl -fsSL https://get.docker.com | sh
         DOCKER_INSTALL_RC=$?
