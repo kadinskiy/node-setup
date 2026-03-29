@@ -2,9 +2,17 @@
 
 # ============================================================
 #  VPN Node Firewall Setup Script (Tailscale edition)
-#  v2.2 — stealth / anti-TSPU / anti-DPI hardening + Docker + Remnawave
-#  Использование: sudo bash node-setup.sh
+#  v2.4 — подкоманды: setup / add-port / list / install
+#
+#  Использование:
+#    sudo bash node-setup.sh            — полная первичная настройка
+#    sudo bash node-setup.sh install    — установить как 'vpnctl'
+#    vpnctl add-port                    — быстро добавить порт
+#    vpnctl list                        — список открытых портов
+#    vpnctl help                        — справка
 # ============================================================
+
+set -euo pipefail
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -21,6 +29,9 @@ SSH_PUBKEY=""
 INSTALL_DOCKER=false
 INSTALL_REMNAWAVE=false
 
+NFTABLES_CONF="/etc/nftables.conf"
+VPNCTL_BIN="/usr/local/bin/vpnctl"
+
 info()    { echo -e "${CYAN}[INFO]${NC} $1"; }
 success() { echo -e "${GREEN}[OK]${NC}   $1"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
@@ -32,9 +43,7 @@ header()  {
 }
 
 ask() {
-    local prompt="$1"
-    local default="$2"
-    local result
+    local prompt="$1" default="$2" result
     if [[ -n "$default" ]]; then
         read -rp "$(echo -e "${YELLOW}")${prompt} [${default}]: $(echo -e "${NC}")" result
         echo "${result:-$default}"
@@ -45,9 +54,7 @@ ask() {
 }
 
 ask_yn() {
-    local prompt="$1"
-    local default="${2:-y}"
-    local result
+    local prompt="$1" default="${2:-y}" result
     read -rp "$(echo -e "${YELLOW}")${prompt} [y/n] (${default}): $(echo -e "${NC}")" result
     result="${result:-$default}"
     [[ "${result,,}" == "y" ]]
@@ -55,14 +62,14 @@ ask_yn() {
 
 validate_ip() {
     local ip="$1"
-    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        IFS='.' read -ra parts <<< "$ip"
-        for part in "${parts[@]}"; do
-            [[ "$part" -gt 255 ]] && return 1
-        done
-        return 0
-    fi
-    return 1
+    # Принимаем одиночный IP и CIDR (например 10.0.0.0/8)
+    local addr="${ip%%/*}"
+    [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -ra parts <<< "$addr"
+    for part in "${parts[@]}"; do
+        [[ "$part" -gt 255 ]] && return 1
+    done
+    return 0
 }
 
 validate_port() {
@@ -71,12 +78,236 @@ validate_port() {
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        error "Скрипт должен запускаться от root. Используйте: sudo bash node-setup.sh"
+        error "Нужны права root. Используйте: sudo $0 ${1:-}"
         exit 1
     fi
 }
 
-# ── Tailscale ────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+#  ПОДКОМАНДА: install
+#  Копирует скрипт в /usr/local/bin/vpnctl
+# ════════════════════════════════════════════════════════════
+
+cmd_install() {
+    check_root
+
+    SCRIPT_SRC="$(realpath "$0")"
+
+    if [[ "$SCRIPT_SRC" != "$VPNCTL_BIN" ]]; then
+        cp "$SCRIPT_SRC" "$VPNCTL_BIN"
+        chmod +x "$VPNCTL_BIN"
+        success "Установлено: $VPNCTL_BIN"
+    else
+        success "Уже установлено: $VPNCTL_BIN"
+    fi
+
+    echo ""
+    echo -e "${BOLD}Доступные команды:${NC}"
+    echo -e "  ${GREEN}vpnctl${NC}              — полная первичная настройка"
+    echo -e "  ${GREEN}vpnctl add-port${NC}     — быстро добавить порт/IP в фаервол"
+    echo -e "  ${GREEN}vpnctl list${NC}         — показать открытые порты"
+    echo -e "  ${GREEN}vpnctl help${NC}         — справка"
+    echo ""
+}
+
+# ════════════════════════════════════════════════════════════
+#  ПОДКОМАНДА: list
+#  Показывает текущие правила nftables
+# ════════════════════════════════════════════════════════════
+
+cmd_list() {
+    check_root
+    header "Открытые порты"
+
+    if ! command -v nft &>/dev/null; then
+        error "nftables не установлен"
+        exit 1
+    fi
+
+    echo -e "${BOLD}Live-правила (inet filter · input):${NC}"
+    echo ""
+    nft list chain inet filter input 2>/dev/null \
+        | grep -E 'dport|saddr|iif|policy' \
+        | sed \
+            -e 's/^[[:space:]]*/  /' \
+            -e "s/accept/${GREEN}accept${NC}/g" \
+            -e "s/\bdrop\b/${RED}drop${NC}/g" \
+            -e "s/\btcp\b/${CYAN}tcp${NC}/g" \
+            -e "s/\budp\b/${CYAN}udp${NC}/g" \
+        || warn "Правила не найдены или nftables не запущен"
+
+    echo ""
+
+    if [[ -f "$NFTABLES_CONF" ]]; then
+        echo -e "${BOLD}Персистентные правила ($NFTABLES_CONF):${NC}"
+        echo ""
+        grep -E '^\s+(tcp|udp|ip saddr).*(dport|accept)' "$NFTABLES_CONF" \
+            | grep -v '#.*SSH\|#.*ssh' \
+            | sed 's/^[[:space:]]*/  /' \
+            || info "Дополнительных портов не найдено"
+        echo ""
+    fi
+}
+
+# ════════════════════════════════════════════════════════════
+#  ПОДКОМАНДА: add-port
+#  Добавляет порт в live-nftables и персистентный конфиг
+# ════════════════════════════════════════════════════════════
+
+cmd_add_port() {
+    check_root
+    header "Добавить порт"
+
+    if ! command -v nft &>/dev/null; then
+        error "nftables не установлен. Сначала выполните полную настройку."
+        exit 1
+    fi
+
+    if [[ ! -f "$NFTABLES_CONF" ]]; then
+        error "Конфиг $NFTABLES_CONF не найден. Сначала выполните полную настройку."
+        exit 1
+    fi
+
+    # ── Сбор параметров ──────────────────────────────────────
+    while true; do
+        PORT=$(ask "Порт")
+        validate_port "$PORT" && break
+        error "Некорректный порт (1–65535)."
+    done
+
+    SRC_IP=$(ask "Источник: IP, CIDR или Enter = любой")
+    if [[ -n "$SRC_IP" ]] && ! validate_ip "$SRC_IP"; then
+        warn "Некорректный IP/CIDR — порт будет открыт для всех."
+        SRC_IP=""
+    fi
+
+    PROTO=$(ask "Протокол" "both")
+    case "$PROTO" in
+        tcp|udp|both) ;;
+        *) warn "Неизвестный протокол, используем both"; PROTO="both" ;;
+    esac
+
+    COMMENT=$(ask "Комментарий (необязательно)")
+
+    # ── Формируем правила ────────────────────────────────────
+    make_rule() {
+        local p="$1"
+        if [[ -n "$SRC_IP" ]]; then
+            echo "ip saddr $SRC_IP $p dport $PORT accept"
+        else
+            echo "$p dport $PORT accept"
+        fi
+    }
+
+    declare -a RULES=()
+    case "$PROTO" in
+        tcp)  RULES+=("$(make_rule tcp)") ;;
+        udp)  RULES+=("$(make_rule udp)") ;;
+        both) RULES+=("$(make_rule tcp)" "$(make_rule udp)") ;;
+    esac
+
+    # ── Превью ───────────────────────────────────────────────
+    echo ""
+    echo -e "${BOLD}Будут добавлены правила:${NC}"
+    for r in "${RULES[@]}"; do
+        echo -e "  ${GREEN}+${NC} $r"
+    done
+    echo ""
+    ask_yn "Применить?" "y" || { warn "Отменено."; return 0; }
+
+    # ── Live-применение ──────────────────────────────────────
+    APPLIED=0
+    for rule in "${RULES[@]}"; do
+        if nft add rule inet filter input $rule 2>/dev/null; then
+            success "Live: $rule"
+            APPLIED=$((APPLIED + 1))
+        else
+            error "Live-применение не удалось: $rule"
+        fi
+    done
+
+    # ── Запись в конфиг ──────────────────────────────────────
+    # Резервная копия
+    cp "$NFTABLES_CONF" "${NFTABLES_CONF}.bak.$(date +%s)"
+
+    # Формируем блок строк для вставки
+    BLOCK=""
+    [[ -n "$COMMENT" ]] && BLOCK+="        # ${COMMENT}\n"
+    for rule in "${RULES[@]}"; do
+        BLOCK+="        ${rule}\n"
+    done
+
+    # Вставляем перед первым 'drop' в таблице inet (не ip6)
+    python3 - "$NFTABLES_CONF" "$BLOCK" << 'PYEOF'
+import sys, re
+
+path  = sys.argv[1]
+block = sys.argv[2]   # уже содержит \n как escape-последовательности
+
+with open(path) as f:
+    content = f.read()
+
+inet_pos = content.find('table inet')
+if inet_pos == -1:
+    sys.exit("ERR: table inet не найдена")
+
+drop_m = re.search(r'^        drop$', content[inet_pos:], re.MULTILINE)
+if not drop_m:
+    sys.exit("ERR: drop не найден в inet filter")
+
+ins = inet_pos + drop_m.start()
+# Раскрываем escape \n в реальные переносы строк
+block_real = block.replace('\\n', '\n')
+new = content[:ins] + block_real + content[ins:]
+
+with open(path, 'w') as f:
+    f.write(new)
+PYEOF
+
+    if [[ $? -eq 0 ]]; then
+        success "Конфиг обновлён: $NFTABLES_CONF"
+    else
+        error "Не удалось обновить конфиг автоматически."
+        warn "Добавьте вручную в $NFTABLES_CONF перед строкой 'drop':"
+        for rule in "${RULES[@]}"; do
+            echo "        $rule"
+        done
+        return 1
+    fi
+
+    # ── Итог ─────────────────────────────────────────────────
+    echo ""
+    if [[ $APPLIED -gt 0 ]]; then
+        success "Порт $PORT ($PROTO${SRC_IP:+ ← $SRC_IP}) активен и сохранён."
+    else
+        warn "Записано в конфиг, но live-применение не удалось."
+        warn "Перезапустите: systemctl restart nftables"
+    fi
+    info "Просмотр: vpnctl list"
+    echo ""
+}
+
+# ════════════════════════════════════════════════════════════
+#  ПОДКОМАНДА: help
+# ════════════════════════════════════════════════════════════
+
+cmd_help() {
+    echo ""
+    echo -e "${BOLD}${CYAN}vpnctl — управление VPN нодой${NC}"
+    echo ""
+    echo -e "  ${GREEN}vpnctl${NC}              Полная первичная настройка сервера"
+    echo -e "  ${GREEN}vpnctl install${NC}      Установить как системную команду vpnctl"
+    echo -e "  ${GREEN}vpnctl add-port${NC}     Быстро добавить порт + IP в фаервол"
+    echo -e "  ${GREEN}vpnctl list${NC}         Показать активные правила фаервола"
+    echo -e "  ${GREEN}vpnctl help${NC}         Эта справка"
+    echo ""
+    echo -e "  ${CYAN}Алиасы:${NC} add = add-port, ls = list"
+    echo ""
+}
+
+# ════════════════════════════════════════════════════════════
+#  ПОЛНАЯ ПЕРВИЧНАЯ НАСТРОЙКА
+# ════════════════════════════════════════════════════════════
 
 setup_tailscale() {
     header "Настройка Tailscale"
@@ -84,23 +315,20 @@ setup_tailscale() {
     if ! command -v tailscale &>/dev/null; then
         info "Tailscale не найден — устанавливаем..."
         curl -fsSL https://tailscale.com/install.sh | sh
-        if ! command -v tailscale &>/dev/null; then
-            error "Не удалось установить Tailscale. Установите вручную и перезапустите скрипт."
-            exit 1
-        fi
+        command -v tailscale &>/dev/null \
+            || { error "Не удалось установить Tailscale."; exit 1; }
         success "Tailscale установлен"
     else
         success "Tailscale уже установлен"
     fi
 
-    if ! systemctl is-active --quiet tailscaled 2>/dev/null; then
-        systemctl enable tailscaled --now 2>/dev/null
-    fi
+    systemctl is-active --quiet tailscaled 2>/dev/null \
+        || systemctl enable tailscaled --now 2>/dev/null
 
     TAILSCALE_IP=$(tailscale ip -4 2>/dev/null)
 
     if [[ -z "$TAILSCALE_IP" ]]; then
-        info "Нода не авторизована в Tailscale. Запускаем авторизацию..."
+        info "Нода не авторизована — запускаем авторизацию..."
         tailscale up --shields-up
         for i in {1..15}; do
             TAILSCALE_IP=$(tailscale ip -4 2>/dev/null)
@@ -111,188 +339,150 @@ setup_tailscale() {
         tailscale set --shields-up 2>/dev/null || true
     fi
 
-    if [[ -z "$TAILSCALE_IP" ]]; then
-        error "Не удалось получить Tailscale IP. Авторизуйтесь вручную: tailscale up --shields-up"
-        exit 1
-    fi
+    [[ -n "$TAILSCALE_IP" ]] \
+        || { error "Не удалось получить Tailscale IP."; exit 1; }
 
-    success "Tailscale IP этой ноды: $TAILSCALE_IP"
+    success "Tailscale IP: $TAILSCALE_IP"
 }
-
-# ── Сбор данных ──────────────────────────────────────────────
 
 collect_config() {
     header "Настройка ноды — сбор параметров"
 
     while true; do
         ADMIN_IP=$(ask "Tailscale IP вашего управляющего компьютера (Windows)")
-        if validate_ip "$ADMIN_IP"; then
-            break
-        else
-            error "Некорректный IP. Попробуйте ещё раз."
-        fi
+        validate_ip "$ADMIN_IP" && break
+        error "Некорректный IP."
     done
 
     while true; do
         SSH_PORT=$(ask "Новый порт SSH (рекомендуется 49152–65535)" "51822")
-        if validate_port "$SSH_PORT"; then
-            break
-        else
-            error "Некорректный порт."
-        fi
+        validate_port "$SSH_PORT" && break
+        error "Некорректный порт."
     done
 
     header "Дополнительные порты"
-    info "Добавьте порты которые нужно открыть (например 443, 2083)."
 
     while true; do
-        if ask_yn "Добавить порт?"; then
-            while true; do
-                port=$(ask "Порт")
-                if validate_port "$port"; then
-                    break
-                else
-                    error "Некорректный порт."
-                fi
-            done
+        ask_yn "Добавить порт?" || break
 
-            ip_for_port=$(ask "Разрешённый IP для порта $port (Enter = любой IP)")
-            if [[ -n "$ip_for_port" ]] && ! validate_ip "$ip_for_port"; then
-                error "Некорректный IP — порт будет открыт для всех."
-                ip_for_port=""
-            fi
+        while true; do
+            port=$(ask "Порт")
+            validate_port "$port" && break
+            error "Некорректный порт."
+        done
 
-            proto=$(ask "Протокол: tcp / udp / both" "both")
-
-            EXTRA_PORTS+=("$port")
-            EXTRA_IPS+=("$ip_for_port")
-            EXTRA_PROTO+=("$proto")
-
-            success "Порт $port добавлен (IP: ${ip_for_port:-любой}, протокол: $proto)"
-        else
-            break
+        ip_for_port=$(ask "Разрешённый IP (Enter = любой)")
+        if [[ -n "$ip_for_port" ]] && ! validate_ip "$ip_for_port"; then
+            error "Некорректный IP — порт будет открыт для всех."
+            ip_for_port=""
         fi
+
+        proto=$(ask "Протокол: tcp / udp / both" "both")
+        EXTRA_PORTS+=("$port")
+        EXTRA_IPS+=("$ip_for_port")
+        EXTRA_PROTO+=("$proto")
+        success "Порт $port (IP: ${ip_for_port:-любой}, $proto)"
     done
 
-    if ask_yn "Установить и настроить Fail2Ban?" "y"; then
-        USE_FAIL2BAN=true
-    fi
+    ask_yn "Установить Fail2Ban?" "y" && USE_FAIL2BAN=true
+    ask_yn "Установить Docker?"   "y" && INSTALL_DOCKER=true
+    [[ "$INSTALL_DOCKER" == true ]] \
+        && ask_yn "Установить Remnawave Node?" "y" && INSTALL_REMNAWAVE=true
 
-    if ask_yn "Установить Docker?" "y"; then
-        INSTALL_DOCKER=true
-    fi
-
-    if [[ "$INSTALL_DOCKER" == true ]]; then
-        if ask_yn "Установить Remnawave Node?" "y"; then
-            INSTALL_REMNAWAVE=true
-        fi
-    fi
-
-    # ── SSH Public Key ────────────────────────────────────────
     header "SSH ключ для доступа"
     info "Скрипт отключит вход по паролю — нужен ваш публичный SSH ключ."
-    info "Где взять ключ:"
-    info "  Termius → Settings → Keychain → выберите ключ → Copy Public Key"
-    info "  Или на Windows/Mac: cat ~/.ssh/id_ed25519.pub"
+    info "Termius → Settings → Keychain → Copy Public Key"
+    info "Или: cat ~/.ssh/id_ed25519.pub"
     echo ""
 
     while true; do
-        read -rp "$(echo -e "${YELLOW}")Вставьте публичный ключ (ssh-ed25519 / ssh-rsa ...): $(echo -e "${NC}")" SSH_PUBKEY
+        read -rp "$(echo -e "${YELLOW}")Вставьте публичный ключ: $(echo -e "${NC}")" SSH_PUBKEY
         if [[ "$SSH_PUBKEY" =~ ^(ssh-ed25519|ssh-rsa|ssh-ecdsa|ecdsa-sha2-nistp256)[[:space:]]+[A-Za-z0-9+/=]+ ]]; then
             success "Ключ принят"
             break
-        else
-            error "Неверный формат. Ключ должен начинаться с ssh-ed25519 или ssh-rsa."
-            if ! ask_yn "Попробовать снова?"; then
-                warn "Ключ не добавлен! После применения скрипта вход по SSH будет НЕВОЗМОЖЕН."
-                warn "Добавьте вручную: echo 'ВАШ_КЛЮЧ' >> ~/.ssh/authorized_keys"
-                SSH_PUBKEY=""
-                break
-            fi
         fi
+        error "Неверный формат."
+        ask_yn "Попробовать снова?" || { warn "Ключ не добавлен!"; SSH_PUBKEY=""; break; }
     done
 
-    # ── Итог ─────────────────────────────────────────────────
-    header "Итоговая конфигурация"
+    header "Итог"
     echo -e "  Tailscale IP ноды    : ${GREEN}$TAILSCALE_IP${NC}"
-    echo -e "  Управляющий IP (Win) : ${GREEN}$ADMIN_IP${NC}"
+    echo -e "  Управляющий IP       : ${GREEN}$ADMIN_IP${NC}"
     echo -e "  SSH порт             : ${GREEN}$SSH_PORT${NC}"
     for i in "${!EXTRA_PORTS[@]}"; do
-        echo -e "  Порт           : ${GREEN}${EXTRA_PORTS[$i]}${NC} | IP: ${EXTRA_IPS[$i]:-любой} | ${EXTRA_PROTO[$i]}"
+        echo -e "  Порт                 : ${GREEN}${EXTRA_PORTS[$i]}${NC} | IP: ${EXTRA_IPS[$i]:-любой} | ${EXTRA_PROTO[$i]}"
     done
-    echo -e "  Fail2Ban             : ${GREEN}$USE_FAIL2BAN${NC}"
-    echo -e "  Docker               : ${GREEN}$INSTALL_DOCKER${NC}"
-    echo -e "  Remnawave Node       : ${GREEN}$INSTALL_REMNAWAVE${NC}"
-    if [[ -n "$SSH_PUBKEY" ]]; then
-        echo -e "  SSH ключ             : ${GREEN}${SSH_PUBKEY:0:40}...${NC}"
-    else
-        echo -e "  SSH ключ             : ${RED}НЕ ДОБАВЛЕН — вход будет невозможен!${NC}"
-    fi
+    echo -e "  Fail2Ban / Docker    : ${GREEN}$USE_FAIL2BAN${NC} / ${GREEN}$INSTALL_DOCKER${NC}"
+    [[ -n "$SSH_PUBKEY" ]] \
+        && echo -e "  SSH ключ             : ${GREEN}${SSH_PUBKEY:0:40}...${NC}" \
+        || echo -e "  SSH ключ             : ${RED}НЕ ДОБАВЛЕН${NC}"
     echo ""
 
-    if ! ask_yn "Всё верно? Применить настройки?"; then
-        warn "Отменено пользователем."
-        exit 0
-    fi
+    ask_yn "Применить настройки?" "y" || { warn "Отменено."; exit 0; }
 }
-
-# ── SSH ──────────────────────────────────────────────────────
 
 setup_ssh() {
     header "Настройка SSH"
 
-    # КРИТИЧНО: отключаем ssh.socket для корректной смены порта
-    info "Отключаем ssh.socket (socket activation)..."
     if systemctl is-active --quiet ssh.socket 2>/dev/null; then
         systemctl stop ssh.socket 2>/dev/null
         systemctl disable ssh.socket 2>/dev/null
-        success "ssh.socket остановлен и отключён"
+        success "ssh.socket отключён"
     fi
 
-    # Включаем обычный ssh.service
     systemctl enable ssh.service 2>/dev/null
-    success "ssh.service включён в автозагрузку"
-
     SSH_SERVICE=$(systemctl list-units --type=service 2>/dev/null | grep -oE 'ssh(d)?\.service' | head -1)
     SSH_SERVICE=${SSH_SERVICE:-ssh}
 
     cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
-    success "Бэкап: /etc/ssh/sshd_config.bak"
 
-    sed -i "s/^#\?Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
+    sshd_set() {
+        local key="$1" val="$2"
+        sed -i "/^[[:space:]]*#\?[[:space:]]*${key}[[:space:]]/d" /etc/ssh/sshd_config
+        echo "${key} ${val}" >> /etc/ssh/sshd_config
+    }
 
-    declare -A SSH_OPTS=(
-        ["PermitRootLogin"]="yes"
-        ["PasswordAuthentication"]="no"
-        ["PubkeyAuthentication"]="yes"
-        ["MaxAuthTries"]="3"
-        ["LoginGraceTime"]="20"
-        ["X11Forwarding"]="no"
-        ["AllowAgentForwarding"]="no"
-        ["AllowTcpForwarding"]="no"
-        ["Banner"]="none"
-        ["DebianBanner"]="no"
-        ["ClientAliveInterval"]="300"
-        ["ClientAliveCountMax"]="2"
-        ["KexAlgorithms"]="curve25519-sha256,curve25519-sha256@libssh.org"
-        ["Ciphers"]="chacha20-poly1305@openssh.com,aes256-gcm@openssh.com"
-        ["MACs"]="hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com"
-    )
+    sshd_set "Port"                   "$SSH_PORT"
+    sshd_set "PermitRootLogin"        "yes"
+    sshd_set "PasswordAuthentication" "no"
+    sshd_set "PubkeyAuthentication"   "yes"
+    sshd_set "MaxAuthTries"           "3"
+    sshd_set "LoginGraceTime"         "20"
+    sshd_set "X11Forwarding"          "no"
+    sshd_set "AllowAgentForwarding"   "no"
+    sshd_set "AllowTcpForwarding"     "no"
+    sshd_set "Banner"                 "none"
+    sshd_set "ClientAliveInterval"    "300"
+    sshd_set "ClientAliveCountMax"    "2"
 
-    for key in "${!SSH_OPTS[@]}"; do
-        val="${SSH_OPTS[$key]}"
-        if grep -qE "^#?${key}" /etc/ssh/sshd_config; then
-            sed -i "s/^#\?${key}.*/${key} ${val}/" /etc/ssh/sshd_config
-        else
-            echo "${key} ${val}" >> /etc/ssh/sshd_config
-        fi
-    done
+    sshd -T 2>/dev/null | grep -qi "debianbanner" && sshd_set "DebianBanner" "no"
 
-    sed -i '/AllowUsers youruser/d' /etc/ssh/sshd_config
+    WANT_KEX="curve25519-sha256,curve25519-sha256@libssh.org"
+    WANT_CIPHERS="chacha20-poly1305@openssh.com,aes256-gcm@openssh.com"
+    WANT_MACS="hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com"
 
-    # Проверяем конфиг перед перезапуском
-    if ! sshd -t 2>/dev/null; then
-        error "Ошибка в конфиге sshd! Восстанавливаем бэкап..."
+    TEST_CONF=$(mktemp)
+    printf "Port 22\nKexAlgorithms %s\nCiphers %s\nMACs %s\n" \
+        "$WANT_KEX" "$WANT_CIPHERS" "$WANT_MACS" > "$TEST_CONF"
+
+    if sshd -t -f "$TEST_CONF" 2>/dev/null; then
+        sshd_set "KexAlgorithms" "$WANT_KEX"
+        sshd_set "Ciphers"       "$WANT_CIPHERS"
+        sshd_set "MACs"          "$WANT_MACS"
+        success "Криптоалгоритмы применены"
+    else
+        for pair in "KexAlgorithms $WANT_KEX" "Ciphers $WANT_CIPHERS" "MACs $WANT_MACS"; do
+            TF=$(mktemp); echo "$pair" > "$TF"
+            sshd -t -f "$TF" 2>/dev/null && sshd_set ${pair% *} "${pair#* }"
+            rm -f "$TF"
+        done
+    fi
+    rm -f "$TEST_CONF"
+
+    SSHD_CHECK=$(sshd -t 2>&1)
+    if [[ $? -ne 0 ]]; then
+        error "Ошибка конфига sshd — восстанавливаем бэкап:"
+        echo "$SSHD_CHECK" | while IFS= read -r line; do error "  $line"; done
         cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
         systemctl restart "$SSH_SERVICE" 2>/dev/null
         exit 1
@@ -300,70 +490,41 @@ setup_ssh() {
 
     systemctl restart "$SSH_SERVICE" 2>/dev/null \
         && success "SSH перезапущен на порту $SSH_PORT" \
-        || error "Ошибка перезапуска SSH. Проверьте: sshd -t"
+        || { error "Ошибка перезапуска SSH"; exit 1; }
 
-    # Проверяем что SSH слушает на правильном порту
     sleep 2
-    if ss -tlnp | grep -q ":$SSH_PORT"; then
-        success "SSH успешно слушает на порту $SSH_PORT"
-    else
-        warn "SSH может не слушать на порту $SSH_PORT. Проверьте: ss -tlnp | grep ssh"
-    fi
+    ss -tlnp | grep -q ":$SSH_PORT" \
+        && success "SSH слушает на порту $SSH_PORT" \
+        || warn "Проверьте: ss -tlnp | grep ssh"
 }
 
-# ── Авторизованные ключи ─────────────────────────────────────
-
 setup_authorized_keys() {
-    header "Настройка SSH ключа"
+    header "SSH ключ"
+    [[ -z "$SSH_PUBKEY" ]] && { warn "Ключ не указан — пропускаем."; return; }
 
-    if [[ -z "$SSH_PUBKEY" ]]; then
-        warn "Публичный ключ не указан — пропускаем."
-        return
-    fi
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh
+    grep -qF "$SSH_PUBKEY" /root/.ssh/authorized_keys 2>/dev/null \
+        && warn "Ключ уже есть" \
+        || { echo "$SSH_PUBKEY" >> /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; success "Ключ добавлен в /root/.ssh/authorized_keys"; }
 
-    # Всегда добавляем в /root (PermitRootLogin yes)
-    mkdir -p /root/.ssh
-    chmod 700 /root/.ssh
-
-    if grep -qF "$SSH_PUBKEY" /root/.ssh/authorized_keys 2>/dev/null; then
-        warn "Ключ уже есть в /root/.ssh/authorized_keys"
-    else
-        echo "$SSH_PUBKEY" >> /root/.ssh/authorized_keys
-        chmod 600 /root/.ssh/authorized_keys
-        success "Ключ добавлен в /root/.ssh/authorized_keys"
-    fi
-
-    # Если запущен через sudo от другого пользователя — добавляем и ему
     TARGET_USER="${SUDO_USER:-}"
     if [[ -n "$TARGET_USER" && "$TARGET_USER" != "root" ]]; then
         TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
         if [[ -n "$TARGET_HOME" ]]; then
-            mkdir -p "$TARGET_HOME/.ssh"
-            chmod 700 "$TARGET_HOME/.ssh"
-            if ! grep -qF "$SSH_PUBKEY" "$TARGET_HOME/.ssh/authorized_keys" 2>/dev/null; then
-                echo "$SSH_PUBKEY" >> "$TARGET_HOME/.ssh/authorized_keys"
-                chmod 600 "$TARGET_HOME/.ssh/authorized_keys"
-                chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.ssh"
-                success "Ключ добавлен в $TARGET_HOME/.ssh/authorized_keys"
-            fi
+            mkdir -p "$TARGET_HOME/.ssh" && chmod 700 "$TARGET_HOME/.ssh"
+            grep -qF "$SSH_PUBKEY" "$TARGET_HOME/.ssh/authorized_keys" 2>/dev/null \
+                || { echo "$SSH_PUBKEY" >> "$TARGET_HOME/.ssh/authorized_keys"; chmod 600 "$TARGET_HOME/.ssh/authorized_keys"; chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.ssh"; success "Ключ добавлен в $TARGET_HOME/.ssh/authorized_keys"; }
         fi
     fi
-
-    KEY_COUNT=$(grep -c "^ssh-" /root/.ssh/authorized_keys 2>/dev/null || echo 0)
-    success "Итого ключей в authorized_keys: $KEY_COUNT"
 }
-
-# ── Фаервол (nftables) ───────────────────────────────────────
 
 setup_firewall() {
     header "Настройка nftables"
-
     apt-get install -y nftables > /dev/null 2>&1
 
     if command -v at &>/dev/null; then
         echo "nft flush ruleset" | at now + 2 minutes 2>/dev/null
         ROLLBACK_JOB=$(atq 2>/dev/null | tail -1 | awk '{print $1}')
-        warn "Автооткат запланирован на 2 мин. Скрипт отменит его автоматически."
     fi
 
     EXTRA_RULES=""
@@ -371,16 +532,11 @@ setup_firewall() {
         port="${EXTRA_PORTS[$i]}"
         ip="${EXTRA_IPS[$i]}"
         proto="${EXTRA_PROTO[$i]}"
-
         add_rule() {
-            local p="$1"
-            if [[ -n "$ip" ]]; then
-                EXTRA_RULES+="        ip saddr $ip $p dport $port accept\n"
-            else
-                EXTRA_RULES+="        $p dport $port accept\n"
-            fi
+            [[ -n "$ip" ]] \
+                && EXTRA_RULES+="        ip saddr $ip $1 dport $port accept\n" \
+                || EXTRA_RULES+="        $1 dport $port accept\n"
         }
-
         case "$proto" in
             tcp)  add_rule "tcp" ;;
             udp)  add_rule "udp" ;;
@@ -388,7 +544,7 @@ setup_firewall() {
         esac
     done
 
-    cat > /etc/nftables.conf << EOF
+    cat > "$NFTABLES_CONF" << EOF
 #!/usr/sbin/nft -f
 flush ruleset
 
@@ -442,23 +598,16 @@ table ip6 filter {
 }
 EOF
 
-    nft -f /etc/nftables.conf \
+    nft -f "$NFTABLES_CONF" \
         && success "Правила nftables применены" \
-        || { error "Ошибка применения правил nftables!"; return 1; }
+        || { error "Ошибка nftables!"; return 1; }
 
     systemctl enable nftables > /dev/null 2>&1
-    success "nftables включён в автозагрузку"
-
-    if [[ -n "${ROLLBACK_JOB:-}" ]]; then
-        atrm "$ROLLBACK_JOB" 2>/dev/null && success "Автооткат отменён — правила стабильны"
-    fi
+    [[ -n "${ROLLBACK_JOB:-}" ]] && atrm "$ROLLBACK_JOB" 2>/dev/null && success "Автооткат отменён"
 }
-
-# ── sysctl hardening ─────────────────────────────────────────
 
 setup_sysctl() {
     header "Сетевой hardening (sysctl)"
-
     cp /etc/sysctl.conf /etc/sysctl.conf.bak
     sed -i '/# === VPN Node Hardening ===/,/^$/d' /etc/sysctl.conf
 
@@ -492,15 +641,11 @@ net.ipv4.conf.default.log_martians = 0
 net.core.somaxconn = 1024
 EOF
 
-    sysctl -p > /dev/null 2>&1 && success "sysctl применён" \
-        || warn "Некоторые параметры sysctl не применились (возможно, ядро старое)"
+    sysctl -p > /dev/null 2>&1 && success "sysctl применён" || warn "Часть параметров не применилась"
 }
 
-# ── Fail2Ban ─────────────────────────────────────────────────
-
 setup_fail2ban() {
-    header "Настройка Fail2Ban"
-
+    header "Fail2Ban"
     apt-get install -y fail2ban > /dev/null 2>&1
 
     cat > /etc/fail2ban/jail.local << EOF
@@ -520,157 +665,90 @@ maxretry = 3
 EOF
 
     systemctl enable fail2ban --now 2>/dev/null \
-        && success "Fail2Ban запущен (бан на 24ч, drop-режим)" \
+        && success "Fail2Ban запущен" \
         || warn "Fail2Ban не запустился — проверьте логи"
 }
 
-# ── Docker ───────────────────────────────────────────────────
-
 setup_docker() {
-    header "Установка Docker"
+    header "Docker"
+    command -v docker &>/dev/null \
+        && { success "Docker уже установлен"; return; }
 
-    if command -v docker &>/dev/null; then
-        success "Docker уже установлен (версия: $(docker --version))"
-        return
-    fi
-
-    info "Устанавливаем Docker через официальный скрипт..."
     curl -fsSL https://get.docker.com | sh > /dev/null 2>&1
-
-    if ! command -v docker &>/dev/null; then
-        error "Не удалось установить Docker. Установите вручную."
-        return 1
-    fi
+    command -v docker &>/dev/null \
+        || { error "Не удалось установить Docker"; return 1; }
 
     systemctl enable docker --now 2>/dev/null
-    success "Docker установлен и запущен (версия: $(docker --version))"
-
-    # Проверяем docker compose
-    if docker compose version &>/dev/null; then
-        success "Docker Compose уже доступен (версия: $(docker compose version))"
-    else
-        warn "Docker Compose не найден. Обновите Docker или установите вручную."
-    fi
+    success "Docker установлен ($(docker --version))"
+    docker compose version &>/dev/null \
+        && success "Docker Compose: $(docker compose version)" \
+        || warn "Docker Compose не найден"
 }
-
-# ── Remnawave Node ───────────────────────────────────────────
 
 setup_remnawave() {
-    header "Настройка Remnawave Node"
-
+    header "Remnawave Node"
     REMNA_DIR="/opt/remnanode"
-    info "Создаём директорию проекта: $REMNA_DIR"
     mkdir -p "$REMNA_DIR"
     cd "$REMNA_DIR" || { error "Не удалось перейти в $REMNA_DIR"; return 1; }
-    success "Директория создана: $REMNA_DIR"
 
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${YELLOW}  ВНИМАНИЕ: Сейчас откроется nano для создания docker-compose.yml${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "  ${YELLOW}1.${NC} Перейдите в панель Remnawave → Nodes → Management"
-    echo -e "  ${YELLOW}2.${NC} Нажмите кнопку '+' для добавления новой ноды"
-    echo -e "  ${YELLOW}3.${NC} Заполните форму (обратите внимание на Node Port)"
-    echo -e "  ${YELLOW}4.${NC} Нажмите 'Copy docker-compose.yml' и скопируйте конфигурацию"
-    echo -e "  ${YELLOW}5.${NC} Вставьте конфигурацию в nano (правая кнопка мыши → Paste)"
-    echo -e "  ${YELLOW}6.${NC} Сохраните файл: ${GREEN}Ctrl+O${NC} → ${GREEN}Enter${NC} → ${GREEN}Ctrl+X${NC}"
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-
-    read -rp "$(echo -e "${YELLOW}")Нажмите Enter, когда будете готовы открыть nano...$(echo -e "${NC}")"
-
+    echo -e "\n${YELLOW}Remnawave → Nodes → '+' → Copy docker-compose.yml → вставьте в nano${NC}\n"
+    read -rp "$(echo -e "${YELLOW}")Нажмите Enter чтобы открыть nano...$(echo -e "${NC}")"
     nano docker-compose.yml
 
-    if [[ ! -f "docker-compose.yml" ]]; then
-        error "Файл docker-compose.yml не найден. Создайте его вручную в $REMNA_DIR"
-        return 1
-    fi
-
-    success "Файл docker-compose.yml создан"
-
-    echo ""
-    info "Запускаем контейнеры..."
-    echo ""
+    [[ -f "docker-compose.yml" ]] \
+        || { error "docker-compose.yml не найден"; return 1; }
 
     docker compose up -d && docker compose logs -f -t
-
-    success "Remnawave Node настроен и запущен"
-    echo ""
-    info "Для просмотра логов в будущем используйте:"
-    echo -e "  ${GREEN}cd $REMNA_DIR && docker compose logs -f -t${NC}"
+    success "Remnawave Node запущен"
 }
 
-# ── Stealth extras ───────────────────────────────────────────
-
 setup_stealth_extras() {
-    header "Дополнительная stealth-настройка"
-
-    OLD_HOSTNAME=$(hostname)
+    header "Stealth"
     NEW_HOSTNAME="srv-$(head -c4 /dev/urandom | xxd -p)"
-    hostnamectl set-hostname "$NEW_HOSTNAME" 2>/dev/null \
-        && success "Hostname изменён: $OLD_HOSTNAME → $NEW_HOSTNAME" \
-        || warn "Не удалось изменить hostname"
-
+    hostnamectl set-hostname "$NEW_HOSTNAME" 2>/dev/null && success "Hostname → $NEW_HOSTNAME"
     truncate -s 0 /etc/motd 2>/dev/null
     echo "" > /etc/issue 2>/dev/null
     echo "" > /etc/issue.net 2>/dev/null
-    success "MOTD и issue очищены"
-
-    SERVICES_TO_DISABLE=(avahi-daemon cups bluetooth ModemManager)
-    for svc in "${SERVICES_TO_DISABLE[@]}"; do
-        if systemctl is-active --quiet "$svc" 2>/dev/null; then
-            systemctl disable --now "$svc" 2>/dev/null \
-                && info "Отключён сервис: $svc"
-        fi
+    for svc in avahi-daemon cups bluetooth ModemManager; do
+        systemctl is-active --quiet "$svc" 2>/dev/null \
+            && systemctl disable --now "$svc" 2>/dev/null \
+            && info "Отключён: $svc"
     done
-    success "Лишние сервисы отключены"
     success "Stealth-режим применён"
 }
-
-# ── Итог ─────────────────────────────────────────────────────
 
 print_summary() {
     header "Готово!"
 
-    echo -e "  ${GREEN}✔${NC} Tailscale IP ноды    : $TAILSCALE_IP"
-    echo -e "  ${GREEN}✔${NC} Управляющий IP (Win) : $ADMIN_IP"
-    echo -e "  ${GREEN}✔${NC} SSH порт             : $SSH_PORT"
+    echo -e "  ${GREEN}✔${NC} Tailscale IP  : $TAILSCALE_IP"
+    echo -e "  ${GREEN}✔${NC} SSH порт      : $SSH_PORT"
     for i in "${!EXTRA_PORTS[@]}"; do
-        echo -e "  ${GREEN}✔${NC} Открытый порт       : ${EXTRA_PORTS[$i]} | IP: ${EXTRA_IPS[$i]:-любой} | ${EXTRA_PROTO[$i]}"
+        echo -e "  ${GREEN}✔${NC} Порт          : ${EXTRA_PORTS[$i]} | IP: ${EXTRA_IPS[$i]:-любой} | ${EXTRA_PROTO[$i]}"
     done
-    [[ "$USE_FAIL2BAN" == true ]] && echo -e "  ${GREEN}✔${NC} Fail2Ban             : активен (drop, 24ч)"
-    [[ "$INSTALL_DOCKER" == true ]] && echo -e "  ${GREEN}✔${NC} Docker               : установлен"
-    [[ "$INSTALL_REMNAWAVE" == true ]] && echo -e "  ${GREEN}✔${NC} Remnawave Node       : настроен"
-    if [[ -n "$SSH_PUBKEY" ]]; then
-        echo -e "  ${GREEN}✔${NC} SSH ключ             : добавлен в authorized_keys"
-    else
-        echo -e "  ${RED}✘${NC} SSH ключ             : НЕ ДОБАВЛЕН — добавьте вручную!"
+    [[ "$USE_FAIL2BAN"     == true ]] && echo -e "  ${GREEN}✔${NC} Fail2Ban      : активен"
+    [[ "$INSTALL_DOCKER"   == true ]] && echo -e "  ${GREEN}✔${NC} Docker        : установлен"
+    [[ "$INSTALL_REMNAWAVE"== true ]] && echo -e "  ${GREEN}✔${NC} Remnawave     : запущен"
+    [[ -n "$SSH_PUBKEY" ]] \
+        && echo -e "  ${GREEN}✔${NC} SSH ключ      : добавлен" \
+        || echo -e "  ${RED}✘${NC} SSH ключ      : НЕ ДОБАВЛЕН"
+
+    echo ""
+    echo -e "  ${CYAN}Stealth:${NC} ping↓  IPv6↓  timestamps↓  TTL=128  баннер скрыт"
+    echo -e "  ${CYAN}Подключение:${NC} ${GREEN}$TAILSCALE_IP${NC} : ${GREEN}$SSH_PORT${NC}"
+    echo ""
+    warn "Бэкапы: /etc/ssh/sshd_config.bak | /etc/sysctl.conf.bak"
+    warn "Проверьте SSH до закрытия сессии!"
+    echo ""
+
+    if [[ ! -f "$VPNCTL_BIN" ]]; then
+        echo -e "${CYAN}[СОВЕТ]${NC} Установите удобную команду:"
+        echo -e "  ${GREEN}sudo vpnctl install${NC}"
+        echo -e "  Затем: ${GREEN}vpnctl add-port${NC}  /  ${GREEN}vpnctl list${NC}"
+        echo ""
     fi
-    echo ""
-    echo -e "  ${CYAN}Stealth-меры:${NC}"
-    echo -e "  ${GREEN}✔${NC} ICMP ping заблокирован (icmp_echo_ignore_all + nftables)"
-    echo -e "  ${GREEN}✔${NC} IPv6 отключён полностью (стек + nftables)"
-    echo -e "  ${GREEN}✔${NC} TCP timestamps отключены (нет утечки uptime)"
-    echo -e "  ${GREEN}✔${NC} TTL=128 (имитация Windows)"
-    echo -e "  ${GREEN}✔${NC} Тихий drop вместо RST/ICMP unreachable"
-    echo -e "  ${GREEN}✔${NC} Tailscale shields-up включён"
-    echo -e "  ${GREEN}✔${NC} SSH баннер скрыт, версия сервера скрыта"
-    echo -e "  ${GREEN}✔${NC} Hostname рандомизирован"
-    echo -e "  ${GREEN}✔${NC} MOTD/issue очищены"
-    echo -e "  ${GREEN}✔${NC} ssh.socket отключён (порт SSH корректно изменён)"
-    echo ""
-    echo -e "  ${CYAN}Подключение в Termius:${NC}"
-    echo -e "  Host: ${GREEN}$TAILSCALE_IP${NC}  |  Port: ${GREEN}$SSH_PORT${NC}"
-    echo ""
-    warn "Бэкапы сохранены: /etc/ssh/sshd_config.bak | /etc/sysctl.conf.bak"
-    warn "Проверьте доступность SSH до закрытия текущей сессии!"
 }
 
-# ── Main ─────────────────────────────────────────────────────
-
-main() {
+main_setup() {
     check_root
     setup_tailscale
     collect_config
@@ -679,10 +757,25 @@ main() {
     setup_firewall
     setup_sysctl
     setup_stealth_extras
-    [[ "$USE_FAIL2BAN" == true ]] && setup_fail2ban
-    [[ "$INSTALL_DOCKER" == true ]] && setup_docker
-    [[ "$INSTALL_REMNAWAVE" == true ]] && setup_remnawave
+    [[ "$USE_FAIL2BAN"     == true ]] && setup_fail2ban
+    [[ "$INSTALL_DOCKER"   == true ]] && setup_docker
+    [[ "$INSTALL_REMNAWAVE"== true ]] && setup_remnawave
     print_summary
 }
 
-main
+# ════════════════════════════════════════════════════════════
+#  РОУТИНГ КОМАНД
+# ════════════════════════════════════════════════════════════
+
+case "${1:-}" in
+    add-port|add)   cmd_add_port ;;
+    list|ls)        cmd_list     ;;
+    install)        cmd_install  ;;
+    help|--help|-h) cmd_help     ;;
+    "")             main_setup   ;;
+    *)
+        error "Неизвестная команда: $1"
+        cmd_help
+        exit 1
+        ;;
+esac
