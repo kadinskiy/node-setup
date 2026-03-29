@@ -2,7 +2,7 @@
 
 # ============================================================
 #  VPN Node Firewall Setup Script (Tailscale edition)
-#  v2.1 — stealth / anti-TSPU / anti-DPI hardening
+#  v2.2 — stealth / anti-TSPU / anti-DPI hardening + Docker + Remnawave
 #  Использование: sudo bash node-setup.sh
 # ============================================================
 
@@ -18,6 +18,8 @@ EXTRA_PORTS=()
 EXTRA_IPS=()
 USE_FAIL2BAN=false
 SSH_PUBKEY=""
+INSTALL_DOCKER=false
+INSTALL_REMNAWAVE=false
 
 info()    { echo -e "${CYAN}[INFO]${NC} $1"; }
 success() { echo -e "${GREEN}[OK]${NC}   $1"; }
@@ -176,6 +178,16 @@ collect_config() {
         USE_FAIL2BAN=true
     fi
 
+    if ask_yn "Установить Docker?" "y"; then
+        INSTALL_DOCKER=true
+    fi
+
+    if [[ "$INSTALL_DOCKER" == true ]]; then
+        if ask_yn "Установить Remnawave Node?" "y"; then
+            INSTALL_REMNAWAVE=true
+        fi
+    fi
+
     # ── SSH Public Key ────────────────────────────────────────
     header "SSH ключ для доступа"
     info "Скрипт отключит вход по паролю — нужен ваш публичный SSH ключ."
@@ -209,6 +221,8 @@ collect_config() {
         echo -e "  Порт           : ${GREEN}${EXTRA_PORTS[$i]}${NC} | IP: ${EXTRA_IPS[$i]:-любой} | ${EXTRA_PROTO[$i]}"
     done
     echo -e "  Fail2Ban             : ${GREEN}$USE_FAIL2BAN${NC}"
+    echo -e "  Docker               : ${GREEN}$INSTALL_DOCKER${NC}"
+    echo -e "  Remnawave Node       : ${GREEN}$INSTALL_REMNAWAVE${NC}"
     if [[ -n "$SSH_PUBKEY" ]]; then
         echo -e "  SSH ключ             : ${GREEN}${SSH_PUBKEY:0:40}...${NC}"
     else
@@ -226,6 +240,18 @@ collect_config() {
 
 setup_ssh() {
     header "Настройка SSH"
+
+    # КРИТИЧНО: отключаем ssh.socket для корректной смены порта
+    info "Отключаем ssh.socket (socket activation)..."
+    if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+        systemctl stop ssh.socket 2>/dev/null
+        systemctl disable ssh.socket 2>/dev/null
+        success "ssh.socket остановлен и отключён"
+    fi
+
+    # Включаем обычный ssh.service
+    systemctl enable ssh.service 2>/dev/null
+    success "ssh.service включён в автозагрузку"
 
     SSH_SERVICE=$(systemctl list-units --type=service 2>/dev/null | grep -oE 'ssh(d)?\.service' | head -1)
     SSH_SERVICE=${SSH_SERVICE:-ssh}
@@ -275,6 +301,14 @@ setup_ssh() {
     systemctl restart "$SSH_SERVICE" 2>/dev/null \
         && success "SSH перезапущен на порту $SSH_PORT" \
         || error "Ошибка перезапуска SSH. Проверьте: sshd -t"
+
+    # Проверяем что SSH слушает на правильном порту
+    sleep 2
+    if ss -tlnp | grep -q ":$SSH_PORT"; then
+        success "SSH успешно слушает на порту $SSH_PORT"
+    else
+        warn "SSH может не слушать на порту $SSH_PORT. Проверьте: ss -tlnp | grep ssh"
+    fi
 }
 
 # ── Авторизованные ключи ─────────────────────────────────────
@@ -490,6 +524,84 @@ EOF
         || warn "Fail2Ban не запустился — проверьте логи"
 }
 
+# ── Docker ───────────────────────────────────────────────────
+
+setup_docker() {
+    header "Установка Docker"
+
+    if command -v docker &>/dev/null; then
+        success "Docker уже установлен (версия: $(docker --version))"
+        return
+    fi
+
+    info "Устанавливаем Docker через официальный скрипт..."
+    curl -fsSL https://get.docker.com | sh > /dev/null 2>&1
+
+    if ! command -v docker &>/dev/null; then
+        error "Не удалось установить Docker. Установите вручную."
+        return 1
+    fi
+
+    systemctl enable docker --now 2>/dev/null
+    success "Docker установлен и запущен (версия: $(docker --version))"
+
+    # Проверяем docker compose
+    if docker compose version &>/dev/null; then
+        success "Docker Compose уже доступен (версия: $(docker compose version))"
+    else
+        warn "Docker Compose не найден. Обновите Docker или установите вручную."
+    fi
+}
+
+# ── Remnawave Node ───────────────────────────────────────────
+
+setup_remnawave() {
+    header "Настройка Remnawave Node"
+
+    REMNA_DIR="/opt/remnanode"
+    info "Создаём директорию проекта: $REMNA_DIR"
+    mkdir -p "$REMNA_DIR"
+    cd "$REMNA_DIR" || { error "Не удалось перейти в $REMNA_DIR"; return 1; }
+    success "Директория создана: $REMNA_DIR"
+
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${YELLOW}  ВНИМАНИЕ: Сейчас откроется nano для создания docker-compose.yml${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  ${YELLOW}1.${NC} Перейдите в панель Remnawave → Nodes → Management"
+    echo -e "  ${YELLOW}2.${NC} Нажмите кнопку '+' для добавления новой ноды"
+    echo -e "  ${YELLOW}3.${NC} Заполните форму (обратите внимание на Node Port)"
+    echo -e "  ${YELLOW}4.${NC} Нажмите 'Copy docker-compose.yml' и скопируйте конфигурацию"
+    echo -e "  ${YELLOW}5.${NC} Вставьте конфигурацию в nano (правая кнопка мыши → Paste)"
+    echo -e "  ${YELLOW}6.${NC} Сохраните файл: ${GREEN}Ctrl+O${NC} → ${GREEN}Enter${NC} → ${GREEN}Ctrl+X${NC}"
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    read -rp "$(echo -e "${YELLOW}")Нажмите Enter, когда будете готовы открыть nano...$(echo -e "${NC}")"
+
+    nano docker-compose.yml
+
+    if [[ ! -f "docker-compose.yml" ]]; then
+        error "Файл docker-compose.yml не найден. Создайте его вручную в $REMNA_DIR"
+        return 1
+    fi
+
+    success "Файл docker-compose.yml создан"
+
+    echo ""
+    info "Запускаем контейнеры..."
+    echo ""
+
+    docker compose up -d && docker compose logs -f -t
+
+    success "Remnawave Node настроен и запущен"
+    echo ""
+    info "Для просмотра логов в будущем используйте:"
+    echo -e "  ${GREEN}cd $REMNA_DIR && docker compose logs -f -t${NC}"
+}
+
 # ── Stealth extras ───────────────────────────────────────────
 
 setup_stealth_extras() {
@@ -529,6 +641,8 @@ print_summary() {
         echo -e "  ${GREEN}✔${NC} Открытый порт       : ${EXTRA_PORTS[$i]} | IP: ${EXTRA_IPS[$i]:-любой} | ${EXTRA_PROTO[$i]}"
     done
     [[ "$USE_FAIL2BAN" == true ]] && echo -e "  ${GREEN}✔${NC} Fail2Ban             : активен (drop, 24ч)"
+    [[ "$INSTALL_DOCKER" == true ]] && echo -e "  ${GREEN}✔${NC} Docker               : установлен"
+    [[ "$INSTALL_REMNAWAVE" == true ]] && echo -e "  ${GREEN}✔${NC} Remnawave Node       : настроен"
     if [[ -n "$SSH_PUBKEY" ]]; then
         echo -e "  ${GREEN}✔${NC} SSH ключ             : добавлен в authorized_keys"
     else
@@ -545,6 +659,7 @@ print_summary() {
     echo -e "  ${GREEN}✔${NC} SSH баннер скрыт, версия сервера скрыта"
     echo -e "  ${GREEN}✔${NC} Hostname рандомизирован"
     echo -e "  ${GREEN}✔${NC} MOTD/issue очищены"
+    echo -e "  ${GREEN}✔${NC} ssh.socket отключён (порт SSH корректно изменён)"
     echo ""
     echo -e "  ${CYAN}Подключение в Termius:${NC}"
     echo -e "  Host: ${GREEN}$TAILSCALE_IP${NC}  |  Port: ${GREEN}$SSH_PORT${NC}"
@@ -560,11 +675,13 @@ main() {
     setup_tailscale
     collect_config
     setup_ssh
-    setup_authorized_keys    # <-- новое: ключ добавляется ДО закрытия текущей сессии
+    setup_authorized_keys
     setup_firewall
     setup_sysctl
     setup_stealth_extras
     [[ "$USE_FAIL2BAN" == true ]] && setup_fail2ban
+    [[ "$INSTALL_DOCKER" == true ]] && setup_docker
+    [[ "$INSTALL_REMNAWAVE" == true ]] && setup_remnawave
     print_summary
 }
 
