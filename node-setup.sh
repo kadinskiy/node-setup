@@ -727,20 +727,32 @@ EOF
 setup_docker() {
     header "Docker"
     if command -v docker &>/dev/null; then
-        success "Docker уже установлен"
-        return
+        success "Docker уже установлен ($(docker --version 2>/dev/null || true))"
+    else
+        info "Устанавливаем Docker..."
+        # Отключаем pipefail на время установки — curl|sh может вернуть ненулевой код
+        set +e
+        curl -fsSL https://get.docker.com | sh
+        DOCKER_INSTALL_RC=$?
+        set -e
+
+        if [[ $DOCKER_INSTALL_RC -ne 0 ]]; then
+            warn "Установщик Docker завершился с кодом $DOCKER_INSTALL_RC"
+        fi
+
+        if ! command -v docker &>/dev/null; then
+            error "Docker не найден после установки — пропускаем."
+            warn "Установите вручную: https://docs.docker.com/engine/install/"
+            INSTALL_REMNAWAVE=false
+            return 0
+        fi
+
+        systemctl enable docker --now 2>/dev/null || true
+        success "Docker установлен ($(docker --version 2>/dev/null || true))"
     fi
 
-    curl -fsSL https://get.docker.com | sh > /dev/null 2>&1
-    if ! command -v docker &>/dev/null; then
-        error "Не удалось установить Docker"
-        return 1
-    fi
-
-    systemctl enable docker --now 2>/dev/null || true
-    success "Docker установлен ($(docker --version))"
-    if docker compose version &>/dev/null; then
-        success "Docker Compose: $(docker compose version)"
+    if docker compose version &>/dev/null 2>&1; then
+        success "Docker Compose: $(docker compose version 2>/dev/null || true)"
     else
         warn "Docker Compose не найден"
     fi
