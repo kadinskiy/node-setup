@@ -2,7 +2,7 @@
 
 # ============================================================
 #  VPN Node Firewall Setup Script (Tailscale edition)
-#  v2.6 — подкоманды: setup / add-port / remove-port / list / install
+#  v2.6.1 — подкоманды: setup / add-port / remove-port / list / install
 #
 #  Использование:
 #    sudo bash node-setup.sh             — полная первичная настройка
@@ -118,7 +118,30 @@ backup_nft_conf() {
     cp "$NFTABLES_CONF" "${NFTABLES_CONF}.bak.$(date +%s)"
 }
 
+normalize_nft_conf() {
+    [[ -f "$NFTABLES_CONF" ]] || return 0
+
+    python3 - "$NFTABLES_CONF" << 'PYEOF'
+from pathlib import Path
+import re
+import sys
+
+p = Path(sys.argv[1])
+s = p.read_text(encoding='utf-8')
+orig = s
+
+# Чиним старую поломку вида: accept        drop
+s = re.sub(r'(\baccept)\s+drop\b', r'\1\n        drop', s)
+# На всякий случай: udp/tcp accept сразу перед закрывающей скобкой цепочки
+s = re.sub(r'(\baccept)(\s*)(\n\s*\})', r'\1\n\3', s)
+
+if s != orig:
+    p.write_text(s, encoding='utf-8')
+PYEOF
+}
+
 validate_nft_conf() {
+    normalize_nft_conf
     nft -c -f "$NFTABLES_CONF" >/dev/null 2>&1
 }
 
@@ -804,60 +827,113 @@ setup_firewall() {
         esac
     done
 
-    cat > "$NFTABLES_CONF" << EOF
-#!/usr/sbin/nft -f
-flush ruleset
+    {
+        printf '%s
+' '#!/usr/sbin/nft -f'
+        printf '%s
+' 'flush ruleset'
+        printf '
+'
+        printf '%s
+' 'table inet filter {'
+        printf '%s
+' '    chain input {'
+        printf '%s
+' '        type filter hook input priority 0; policy drop;'
+        printf '
+'
+        printf '%s
+' '        iif "lo" accept'
+        printf '%s
+' '        ct state established,related accept'
+        printf '%s
+' '        ct state invalid drop'
+        printf '
+'
+        printf '%s
+' '        # ICMP: блокируем ping и диагностику'
+        printf '%s
+' '        ip protocol icmp icmp type { echo-request, echo-reply, timestamp-request, timestamp-reply, address-mask-request, address-mask-reply } drop'
+        printf '%s
+' '        ip protocol icmp accept'
+        printf '
+'
+        printf '%s
+' '        # Tailscale — полный доступ внутри mesh'
+        printf '%s
+' '        iif "tailscale0" accept'
+        printf '
+'
+        printf '%s
+' '        # SSH только с управляющего Tailscale IP + rate limit'
+        printf '%s
+' "        ip saddr $ADMIN_IP tcp dport $SSH_PORT ct state new limit rate 5/minute accept"
+        printf '%s
+' "        ip saddr $ADMIN_IP tcp dport $SSH_PORT drop"
+        printf '
+'
+        if [[ -n "$EXTRA_RULES" ]]; then
+            printf '%b' "$EXTRA_RULES"
+        fi
+        printf '%s
+' '        drop'
+        printf '%s
+' '    }'
+        printf '
+'
+        printf '%s
+' '    chain forward {'
+        printf '%s
+' '        type filter hook forward priority 0; policy drop;'
+        printf '%s
+' '    }'
+        printf '
+'
+        printf '%s
+' '    chain output {'
+        printf '%s
+' '        type filter hook output priority 0; policy accept;'
+        printf '%s
+' '    }'
+        printf '%s
+' '}'
+        printf '
+'
+        printf '%s
+' '# IPv6: полная блокировка'
+        printf '%s
+' 'table ip6 filter {'
+        printf '%s
+' '    chain input {'
+        printf '%s
+' '        type filter hook input priority 0; policy drop;'
+        printf '%s
+' '        iif "lo" accept'
+        printf '%s
+' '        ct state established,related accept'
+        printf '%s
+' '        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept'
+        printf '%s
+' '        drop'
+        printf '%s
+' '    }'
+        printf '%s
+' '    chain forward {'
+        printf '%s
+' '        type filter hook forward priority 0; policy drop;'
+        printf '%s
+' '    }'
+        printf '%s
+' '    chain output {'
+        printf '%s
+' '        type filter hook output priority 0; policy accept;'
+        printf '%s
+' '    }'
+        printf '%s
+' '}'
+    } > "$NFTABLES_CONF"
 
-table inet filter {
-    chain input {
-        type filter hook input priority 0; policy drop;
-
-        iif "lo" accept
-        ct state established,related accept
-        ct state invalid drop
-
-        # ICMP: блокируем ping и диагностику
-        ip protocol icmp icmp type { echo-request, echo-reply, timestamp-request, timestamp-reply, address-mask-request, address-mask-reply } drop
-        ip protocol icmp accept
-
-        # Tailscale — полный доступ внутри mesh
-        iif "tailscale0" accept
-
-        # SSH только с управляющего Tailscale IP + rate limit
-        ip saddr $ADMIN_IP tcp dport $SSH_PORT ct state new limit rate 5/minute accept
-        ip saddr $ADMIN_IP tcp dport $SSH_PORT drop
-
-$(printf "%b" "$EXTRA_RULES")
-        drop
-    }
-
-    chain forward {
-        type filter hook forward priority 0; policy drop;
-    }
-
-    chain output {
-        type filter hook output priority 0; policy accept;
-    }
-}
-
-# IPv6: полная блокировка
-table ip6 filter {
-    chain input {
-        type filter hook input priority 0; policy drop;
-        iif "lo" accept
-        ct state established,related accept
-        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept
-        drop
-    }
-    chain forward {
-        type filter hook forward priority 0; policy drop;
-    }
-    chain output {
-        type filter hook output priority 0; policy accept;
-    }
-}
-EOF
-
+    normalize_nft_conf
     info "Проверяем синтаксис $NFTABLES_CONF"
     if ! validate_nft_conf; then
         error "Синтаксическая ошибка в $NFTABLES_CONF"
