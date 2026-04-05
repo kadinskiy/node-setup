@@ -122,6 +122,27 @@ validate_nft_conf() {
     nft -c -f "$NFTABLES_CONF" >/dev/null 2>&1
 }
 
+wait_for_apt() {
+    local waited=0
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; do
+        info "apt занят (${waited}с), ждём освобождения блокировки..."
+        sleep 2
+        waited=$((waited + 2))
+        if [[ $waited -ge 180 ]]; then
+            warn "apt занят слишком долго. Проверьте: ps aux | egrep "apt|dpkg""
+            return 1
+        fi
+    done
+    return 0
+}
+
+apt_install_pkg() {
+    local pkg="$1"
+    wait_for_apt || return 1
+    info "Устанавливаем пакет: $pkg"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg"
+}
+
 get_drop_handle() {
     nft -a list chain inet filter input 2>/dev/null \
         | grep -E '^[[:space:]]*drop([[:space:]]|$)' \
@@ -750,10 +771,16 @@ setup_authorized_keys() {
 
 setup_firewall() {
     header "Настройка nftables"
-    apt-get install -y nftables > /dev/null 2>&1
+
+    if ! command -v nft &>/dev/null; then
+        apt_install_pkg nftables || { error "Не удалось установить nftables"; return 1; }
+    else
+        success "nftables уже установлен"
+    fi
 
     ROLLBACK_JOB=""
     if command -v at &>/dev/null; then
+        info "Ставим временный автооткат правил на 2 минуты"
         echo "nft flush ruleset" | at now + 2 minutes 2>/dev/null || true
         ROLLBACK_JOB=$(atq 2>/dev/null | tail -1 | awk '{print $1}' || true)
     fi
@@ -830,10 +857,18 @@ table ip6 filter {
 }
 EOF
 
+    info "Проверяем синтаксис $NFTABLES_CONF"
+    if ! validate_nft_conf; then
+        error "Синтаксическая ошибка в $NFTABLES_CONF"
+        nft -c -f "$NFTABLES_CONF"
+        return 1
+    fi
+
+    info "Применяем правила nftables"
     if nft -f "$NFTABLES_CONF"; then
         success "Правила nftables применены"
     else
-        error "Ошибка nftables!"
+        error "Ошибка применения nftables!"
         return 1
     fi
 
@@ -888,7 +923,7 @@ EOF
 
 setup_fail2ban() {
     header "Fail2Ban"
-    apt-get install -y fail2ban > /dev/null 2>&1
+    apt_install_pkg fail2ban || { error "Не удалось установить Fail2Ban"; return 1; }
 
     cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
