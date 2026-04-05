@@ -2,14 +2,17 @@
 
 # ============================================================
 #  VPN Node Firewall Setup Script (Tailscale edition)
-#  v2.5 — подкоманды: setup / add-port / list / install
+#  v2.6 — подкоманды: setup / add-port / remove-port / list / install
 #
 #  Использование:
-#    sudo bash node-setup.sh            — полная первичная настройка
-#    sudo bash node-setup.sh install    — установить как 'vpnctl'
-#    vpnctl add-port                    — быстро добавить порт
-#    vpnctl list                        — список открытых портов
-#    vpnctl help                        — справка
+#    sudo bash node-setup.sh             — полная первичная настройка
+#    sudo bash node-setup.sh add-port    — быстро добавить порт/IP в фаервол
+#    sudo bash node-setup.sh remove-port — удалить правило порта/IP из фаервола
+#    sudo bash node-setup.sh install     — обновить / переустановить vpnctl
+#    vpnctl add-port                     — быстро добавить порт/IP в фаервол
+#    vpnctl remove-port                  — удалить правило порта/IP из фаервола
+#    vpnctl list                         — список открытых портов
+#    vpnctl help                         — справка
 # ============================================================
 
 set -euo pipefail
@@ -84,29 +87,201 @@ check_root() {
     fi
 }
 
+ensure_prereqs_for_port_cmds() {
+    if ! command -v nft &>/dev/null; then
+        error "nftables не установлен. Сначала выполните полную настройку."
+        exit 1
+    fi
+
+    if [[ ! -f "$NFTABLES_CONF" ]]; then
+        error "Конфиг $NFTABLES_CONF не найден. Сначала выполните полную настройку."
+        exit 1
+    fi
+}
+
+ensure_self_installed() {
+    check_root
+
+    local script_src
+    script_src="$(realpath "$0")"
+
+    if [[ "$script_src" != "$VPNCTL_BIN" ]]; then
+        cp "$script_src" "$VPNCTL_BIN"
+        chmod +x "$VPNCTL_BIN"
+        success "Команда vpnctl установлена: $VPNCTL_BIN"
+    else
+        success "Команда vpnctl уже доступна: $VPNCTL_BIN"
+    fi
+}
+
+backup_nft_conf() {
+    cp "$NFTABLES_CONF" "${NFTABLES_CONF}.bak.$(date +%s)"
+}
+
+validate_nft_conf() {
+    nft -c -f "$NFTABLES_CONF" >/dev/null 2>&1
+}
+
+get_drop_handle() {
+    nft -a list chain inet filter input 2>/dev/null \
+        | grep -E '^[[:space:]]*drop([[:space:]]|$)' \
+        | sed -n 's/.*# handle \([0-9][0-9]*\)$/\1/p' \
+        | head -1
+}
+
+insert_live_rule_before_drop() {
+    local rule="$1"
+    local drop_handle
+    drop_handle="$(get_drop_handle || true)"
+
+    if [[ -n "$drop_handle" ]]; then
+        nft insert rule inet filter input position "$drop_handle" $rule
+    else
+        nft add rule inet filter input $rule
+    fi
+}
+
+get_rule_handles() {
+    local rule="$1"
+    nft -a list chain inet filter input 2>/dev/null \
+        | grep -F -- "$rule" \
+        | sed -n 's/.*# handle \([0-9][0-9]*\)$/\1/p'
+}
+
+live_rule_exists() {
+    local rule="$1"
+    nft list chain inet filter input 2>/dev/null | grep -Fq -- "$rule"
+}
+
+conf_rule_exists() {
+    local rule="$1"
+    grep -Fq -- "$rule" "$NFTABLES_CONF"
+}
+
+conf_insert_block_before_drop() {
+    local block="$1"
+
+    python3 - "$NFTABLES_CONF" "$block" << 'PYEOF'
+import re
+import sys
+
+path = sys.argv[1]
+block = sys.argv[2].replace('\\n', '\n')
+
+with open(path, encoding='utf-8') as f:
+    content = f.read()
+
+pattern = re.compile(
+    r'(table inet filter\s*\{.*?chain input\s*\{.*?)(^\s*drop\s*$)',
+    re.DOTALL | re.MULTILINE,
+)
+match = pattern.search(content)
+if not match:
+    sys.exit('ERR: не найден terminal drop в table inet filter / chain input')
+
+new_content = content[:match.start(2)] + block + content[match.start(2):]
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(new_content)
+PYEOF
+}
+
+conf_remove_rules_exact() {
+    local joined="$1"
+
+    python3 - "$NFTABLES_CONF" "$joined" << 'PYEOF'
+import sys
+
+path = sys.argv[1]
+rules = {line for line in sys.argv[2].split('\\n') if line.strip()}
+
+with open(path, encoding='utf-8') as f:
+    lines = f.readlines()
+
+new_lines = []
+i = 0
+while i < len(lines):
+    stripped = lines[i].strip()
+
+    if stripped in rules:
+        j = i
+        while j < len(lines) and lines[j].strip() in rules:
+            j += 1
+        if new_lines and new_lines[-1].lstrip().startswith('#'):
+            new_lines.pop()
+        i = j
+        continue
+
+    new_lines.append(lines[i])
+    i += 1
+
+with open(path, 'w', encoding='utf-8') as f:
+    f.writelines(new_lines)
+PYEOF
+}
+
+make_rule_for_values() {
+    local src_ip="$1" proto="$2" port="$3"
+    if [[ -n "$src_ip" ]]; then
+        echo "ip saddr $src_ip $proto dport $port accept"
+    else
+        echo "$proto dport $port accept"
+    fi
+}
+
+build_rules_for_values() {
+    local src_ip="$1" proto="$2" port="$3"
+    local -n out_ref=$4
+
+    out_ref=()
+    case "$proto" in
+        tcp)  out_ref+=("$(make_rule_for_values "$src_ip" tcp "$port")") ;;
+        udp)  out_ref+=("$(make_rule_for_values "$src_ip" udp "$port")") ;;
+        both) out_ref+=("$(make_rule_for_values "$src_ip" tcp "$port")" "$(make_rule_for_values "$src_ip" udp "$port")") ;;
+        *)    return 1 ;;
+    esac
+}
+
+prompt_port_ip_proto() {
+    local port_var="$1" ip_var="$2" proto_var="$3"
+    local port src_ip proto
+
+    while true; do
+        port=$(ask "Порт")
+        if validate_port "$port"; then break; fi
+        error "Некорректный порт (1–65535)."
+    done
+
+    src_ip=$(ask "Источник: IP, CIDR или Enter = любой")
+    if [[ -n "$src_ip" ]] && ! validate_ip "$src_ip"; then
+        warn "Некорректный IP/CIDR — будет использован режим 'любой'."
+        src_ip=""
+    fi
+
+    proto=$(ask "Протокол" "both")
+    case "$proto" in
+        tcp|udp|both) ;;
+        *) warn "Неизвестный протокол, используем both"; proto="both" ;;
+    esac
+
+    printf -v "$port_var" '%s' "$port"
+    printf -v "$ip_var" '%s' "$src_ip"
+    printf -v "$proto_var" '%s' "$proto"
+}
+
 # ════════════════════════════════════════════════════════════
 #  ПОДКОМАНДА: install
 # ════════════════════════════════════════════════════════════
 
 cmd_install() {
-    check_root
-
-    SCRIPT_SRC="$(realpath "$0")"
-
-    if [[ "$SCRIPT_SRC" != "$VPNCTL_BIN" ]]; then
-        cp "$SCRIPT_SRC" "$VPNCTL_BIN"
-        chmod +x "$VPNCTL_BIN"
-        success "Установлено: $VPNCTL_BIN"
-    else
-        success "Уже установлено: $VPNCTL_BIN"
-    fi
+    ensure_self_installed
 
     echo ""
     echo -e "${BOLD}Доступные команды:${NC}"
-    echo -e "  ${GREEN}vpnctl${NC}              — полная первичная настройка"
-    echo -e "  ${GREEN}vpnctl add-port${NC}     — быстро добавить порт/IP в фаервол"
-    echo -e "  ${GREEN}vpnctl list${NC}         — показать открытые порты"
-    echo -e "  ${GREEN}vpnctl help${NC}         — справка"
+    echo -e "  ${GREEN}vpnctl${NC}               — полная первичная настройка"
+    echo -e "  ${GREEN}vpnctl add-port${NC}      — быстро добавить порт/IP в фаервол"
+    echo -e "  ${GREEN}vpnctl remove-port${NC}   — удалить правило порта/IP"
+    echo -e "  ${GREEN}vpnctl list${NC}          — показать открытые порты"
+    echo -e "  ${GREEN}vpnctl help${NC}          — справка"
     echo ""
 }
 
@@ -154,57 +329,20 @@ cmd_list() {
 
 cmd_add_port() {
     check_root
+    ensure_prereqs_for_port_cmds
     header "Добавить порт"
 
-    if ! command -v nft &>/dev/null; then
-        error "nftables не установлен. Сначала выполните полную настройку."
-        exit 1
-    fi
+    local port src_ip proto comment
+    local -a rules=() missing_rules=()
 
-    if [[ ! -f "$NFTABLES_CONF" ]]; then
-        error "Конфиг $NFTABLES_CONF не найден. Сначала выполните полную настройку."
-        exit 1
-    fi
+    prompt_port_ip_proto port src_ip proto
+    comment=$(ask "Комментарий (необязательно)")
 
-    while true; do
-        PORT=$(ask "Порт")
-        if validate_port "$PORT"; then break; fi
-        error "Некорректный порт (1–65535)."
-    done
-
-    SRC_IP=$(ask "Источник: IP, CIDR или Enter = любой")
-    if [[ -n "$SRC_IP" ]] && ! validate_ip "$SRC_IP"; then
-        warn "Некорректный IP/CIDR — порт будет открыт для всех."
-        SRC_IP=""
-    fi
-
-    PROTO=$(ask "Протокол" "both")
-    case "$PROTO" in
-        tcp|udp|both) ;;
-        *) warn "Неизвестный протокол, используем both"; PROTO="both" ;;
-    esac
-
-    COMMENT=$(ask "Комментарий (необязательно)")
-
-    make_rule() {
-        local p="$1"
-        if [[ -n "$SRC_IP" ]]; then
-            echo "ip saddr $SRC_IP $p dport $PORT accept"
-        else
-            echo "$p dport $PORT accept"
-        fi
-    }
-
-    declare -a RULES=()
-    case "$PROTO" in
-        tcp)  RULES+=("$(make_rule tcp)") ;;
-        udp)  RULES+=("$(make_rule udp)") ;;
-        both) RULES+=("$(make_rule tcp)" "$(make_rule udp)") ;;
-    esac
+    build_rules_for_values "$src_ip" "$proto" "$port" rules
 
     echo ""
     echo -e "${BOLD}Будут добавлены правила:${NC}"
-    for r in "${RULES[@]}"; do
+    for r in "${rules[@]}"; do
         echo -e "  ${GREEN}+${NC} $r"
     done
     echo ""
@@ -214,68 +352,119 @@ cmd_add_port() {
         return 0
     fi
 
-    APPLIED=0
-    for rule in "${RULES[@]}"; do
-        if nft add rule inet filter input $rule 2>/dev/null; then
-            success "Live: $rule"
-            APPLIED=$((APPLIED + 1))
+    local applied=0
+    for rule in "${rules[@]}"; do
+        if live_rule_exists "$rule"; then
+            warn "Live-правило уже существует: $rule"
         else
-            error "Live-применение не удалось: $rule"
+            if insert_live_rule_before_drop "$rule" 2>/dev/null; then
+                success "Live: $rule"
+                applied=$((applied + 1))
+            else
+                error "Live-применение не удалось: $rule"
+            fi
+        fi
+
+        if conf_rule_exists "$rule"; then
+            warn "В конфиге уже есть: $rule"
+        else
+            missing_rules+=("$rule")
         fi
     done
 
-    cp "$NFTABLES_CONF" "${NFTABLES_CONF}.bak.$(date +%s)"
+    if [[ ${#missing_rules[@]} -gt 0 ]]; then
+        backup_nft_conf
 
-    BLOCK=""
-    if [[ -n "$COMMENT" ]]; then
-        BLOCK+="        # ${COMMENT}\n"
+        local block=""
+        if [[ -n "$comment" ]]; then
+            block+="        # ${comment}\n"
+        fi
+        for rule in "${missing_rules[@]}"; do
+            block+="        ${rule}\n"
+        done
+
+        if conf_insert_block_before_drop "$block" && validate_nft_conf; then
+            success "Конфиг обновлён: $NFTABLES_CONF"
+        else
+            error "Не удалось обновить конфиг автоматически. Восстанавливаю бэкап."
+            local latest_bak
+            latest_bak=$(ls -1t "${NFTABLES_CONF}.bak."* 2>/dev/null | head -1 || true)
+            [[ -n "$latest_bak" ]] && cp "$latest_bak" "$NFTABLES_CONF"
+            return 1
+        fi
+    else
+        info "В конфиге новые строки не требовались"
     fi
-    for rule in "${RULES[@]}"; do
-        BLOCK+="        ${rule}\n"
+
+    echo ""
+    success "Порт $port ($proto${src_ip:+ ← $src_ip}) обработан."
+    info "Просмотр: vpnctl list"
+    echo ""
+}
+
+# ════════════════════════════════════════════════════════════
+#  ПОДКОМАНДА: remove-port
+# ════════════════════════════════════════════════════════════
+
+cmd_remove_port() {
+    check_root
+    ensure_prereqs_for_port_cmds
+    header "Удалить порт"
+
+    local port src_ip proto
+    local -a rules=()
+    prompt_port_ip_proto port src_ip proto
+    build_rules_for_values "$src_ip" "$proto" "$port" rules
+
+    echo ""
+    echo -e "${BOLD}Будут удалены правила:${NC}"
+    for r in "${rules[@]}"; do
+        echo -e "  ${RED}-${NC} $r"
+    done
+    echo ""
+
+    if ! ask_yn "Удалить?" "y"; then
+        warn "Отменено."
+        return 0
+    fi
+
+    local removed_live=0 removed_conf=0
+
+    for rule in "${rules[@]}"; do
+        mapfile -t handles < <(get_rule_handles "$rule" || true)
+        if [[ ${#handles[@]} -eq 0 ]]; then
+            warn "Live-правило не найдено: $rule"
+        else
+            for h in "${handles[@]}"; do
+                if nft delete rule inet filter input handle "$h" 2>/dev/null; then
+                    success "Live удалён: $rule (handle $h)"
+                    removed_live=$((removed_live + 1))
+                else
+                    warn "Не удалось удалить live-правило: $rule (handle $h)"
+                fi
+            done
+        fi
     done
 
-    python3 - "$NFTABLES_CONF" "$BLOCK" << 'PYEOF'
-import sys, re
-
-path  = sys.argv[1]
-block = sys.argv[2]
-
-with open(path) as f:
-    content = f.read()
-
-inet_pos = content.find('table inet')
-if inet_pos == -1:
-    sys.exit("ERR: table inet не найдена")
-
-drop_m = re.search(r'^        drop$', content[inet_pos:], re.MULTILINE)
-if not drop_m:
-    sys.exit("ERR: drop не найден в inet filter")
-
-ins = inet_pos + drop_m.start()
-block_real = block.replace('\\n', '\n')
-new = content[:ins] + block_real + content[ins:]
-
-with open(path, 'w') as f:
-    f.write(new)
-PYEOF
-
-    if [[ $? -eq 0 ]]; then
+    backup_nft_conf
+    conf_remove_rules_exact "$(printf '%s\n' "${rules[@]}")"
+    if validate_nft_conf; then
         success "Конфиг обновлён: $NFTABLES_CONF"
+        removed_conf=1
     else
-        error "Не удалось обновить конфиг автоматически."
-        warn "Добавьте вручную в $NFTABLES_CONF перед строкой 'drop':"
-        for rule in "${RULES[@]}"; do
-            echo "        $rule"
-        done
+        error "После удаления конфиг стал некорректным. Восстанавливаю бэкап."
+        local latest_bak
+        latest_bak=$(ls -1t "${NFTABLES_CONF}.bak."* 2>/dev/null | head -1 || true)
+        [[ -n "$latest_bak" ]] && cp "$latest_bak" "$NFTABLES_CONF"
         return 1
     fi
 
     echo ""
-    if [[ $APPLIED -gt 0 ]]; then
-        success "Порт $PORT ($PROTO${SRC_IP:+ ← $SRC_IP}) активен и сохранён."
-    else
-        warn "Записано в конфиг, но live-применение не удалось."
-        warn "Перезапустите: systemctl restart nftables"
+    if [[ $removed_live -eq 0 ]]; then
+        warn "Live-правила не были удалены. Если строки были только в конфиге — примените: systemctl restart nftables"
+    fi
+    if [[ $removed_conf -eq 1 ]]; then
+        success "Порт $port ($proto${src_ip:+ ← $src_ip}) удалён из конфигурации"
     fi
     info "Просмотр: vpnctl list"
     echo ""
@@ -289,13 +478,14 @@ cmd_help() {
     echo ""
     echo -e "${BOLD}${CYAN}vpnctl — управление VPN нодой${NC}"
     echo ""
-    echo -e "  ${GREEN}vpnctl${NC}              Полная первичная настройка сервера"
-    echo -e "  ${GREEN}vpnctl install${NC}      Установить как системную команду vpnctl"
-    echo -e "  ${GREEN}vpnctl add-port${NC}     Быстро добавить порт + IP в фаервол"
-    echo -e "  ${GREEN}vpnctl list${NC}         Показать активные правила фаервола"
-    echo -e "  ${GREEN}vpnctl help${NC}         Эта справка"
+    echo -e "  ${GREEN}vpnctl${NC}               Полная первичная настройка сервера"
+    echo -e "  ${GREEN}vpnctl install${NC}       Обновить / переустановить системную команду vpnctl"
+    echo -e "  ${GREEN}vpnctl add-port${NC}      Быстро добавить порт + IP в фаервол"
+    echo -e "  ${GREEN}vpnctl remove-port${NC}   Удалить правило порта + IP из фаервола"
+    echo -e "  ${GREEN}vpnctl list${NC}          Показать активные правила фаервола"
+    echo -e "  ${GREEN}vpnctl help${NC}          Эта справка"
     echo ""
-    echo -e "  ${CYAN}Алиасы:${NC} add = add-port, ls = list"
+    echo -e "  ${CYAN}Алиасы:${NC} add = add-port, del/rm/remove = remove-port, ls = list"
     echo ""
 }
 
@@ -383,7 +573,6 @@ collect_config() {
         success "Порт $port (IP: ${ip_for_port:-любой}, $proto)"
     done
 
-    # FIX: используем if вместо && чтобы set -e не убивал скрипт при ответе "n"
     if ask_yn "Установить Fail2Ban?" "y"; then
         USE_FAIL2BAN=true
     fi
@@ -454,7 +643,6 @@ setup_ssh() {
 
     cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
 
-    # Создаём директорию для privilege separation (нужна для sshd -t)
     mkdir -p /run/sshd
 
     sshd_set() {
@@ -612,8 +800,7 @@ table inet filter {
         ip saddr $ADMIN_IP tcp dport $SSH_PORT ct state new limit rate 5/minute accept
         ip saddr $ADMIN_IP tcp dport $SSH_PORT drop
 
-$(echo -e "$EXTRA_RULES")
-        drop
+$(echo -e "$EXTRA_RULES")        drop
     }
 
     chain forward {
@@ -652,7 +839,6 @@ EOF
 
     systemctl enable nftables > /dev/null 2>&1 || true
 
-    # FIX: проверяем что переменная не пустая перед atrm
     if [[ -n "$ROLLBACK_JOB" ]]; then
         atrm "$ROLLBACK_JOB" 2>/dev/null || true
         success "Автооткат отменён"
@@ -818,7 +1004,6 @@ print_summary() {
         echo -e "  ${GREEN}✔${NC} Порт          : ${EXTRA_PORTS[$i]} | IP: ${EXTRA_IPS[$i]:-любой} | ${EXTRA_PROTO[$i]}"
     done
 
-    # FIX: используем if вместо && чтобы set -e не убивал скрипт
     if [[ "$USE_FAIL2BAN" == true ]]; then
         echo -e "  ${GREEN}✔${NC} Fail2Ban      : активен"
     fi
@@ -835,23 +1020,20 @@ print_summary() {
     fi
 
     echo ""
+    echo -e "  ${GREEN}✔${NC} vpnctl        : доступен как $VPNCTL_BIN"
     echo -e "  ${CYAN}Stealth:${NC} ping↓  IPv6↓  timestamps↓  TTL=128  баннер скрыт"
     echo -e "  ${CYAN}Подключение:${NC} ${GREEN}$TAILSCALE_IP${NC} : ${GREEN}$SSH_PORT${NC}"
     echo ""
-    warn "Бэкапы: /etc/ssh/sshd_config.bak | /etc/sysctl.conf.bak"
+    warn "Бэкапы: /etc/ssh/sshd_config.bak | /etc/sysctl.conf.bak | ${NFTABLES_CONF}.bak.*"
     warn "Проверьте SSH до закрытия сессии!"
     echo ""
-
-    if [[ ! -f "$VPNCTL_BIN" ]]; then
-        echo -e "${CYAN}[СОВЕТ]${NC} Установите удобную команду:"
-        echo -e "  ${GREEN}sudo bash $0 install${NC}"
-        echo -e "  Затем: ${GREEN}vpnctl add-port${NC}  /  ${GREEN}vpnctl list${NC}"
-        echo ""
-    fi
+    info "Команды: vpnctl add-port / vpnctl remove-port / vpnctl list"
+    echo ""
 }
 
 main_setup() {
     check_root
+    ensure_self_installed
     setup_tailscale
     collect_config
     setup_ssh
@@ -860,7 +1042,6 @@ main_setup() {
     setup_sysctl
     setup_stealth_extras
 
-    # FIX: используем if вместо && — set -e не убивает скрипт при false
     if [[ "$USE_FAIL2BAN" == true ]]; then
         setup_fail2ban
     fi
@@ -879,11 +1060,12 @@ main_setup() {
 # ════════════════════════════════════════════════════════════
 
 case "${1:-}" in
-    add-port|add)   cmd_add_port ;;
-    list|ls)        cmd_list     ;;
-    install)        cmd_install  ;;
-    help|--help|-h) cmd_help     ;;
-    "")             main_setup   ;;
+    add-port|add)                cmd_add_port ;;
+    remove-port|remove|rm|del)   cmd_remove_port ;;
+    list|ls)                     cmd_list ;;
+    install)                     cmd_install ;;
+    help|--help|-h)              cmd_help ;;
+    "")                          main_setup ;;
     *)
         error "Неизвестная команда: $1"
         cmd_help
