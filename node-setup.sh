@@ -827,7 +827,8 @@ table inet filter {
         ip saddr $ADMIN_IP tcp dport $SSH_PORT ct state new limit rate 5/minute accept
         ip saddr $ADMIN_IP tcp dport $SSH_PORT drop
 
-$(echo -e "$EXTRA_RULES")        drop
+$(printf "%b" "$EXTRA_RULES")
+        drop
     }
 
     chain forward {
