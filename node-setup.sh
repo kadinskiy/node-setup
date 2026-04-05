@@ -152,7 +152,7 @@ wait_for_apt() {
         sleep 2
         waited=$((waited + 2))
         if [[ $waited -ge 180 ]]; then
-            warn "apt занят слишком долго. Проверьте: ps aux | egrep "apt|dpkg""
+            warn 'apt занят слишком долго. Проверьте: ps aux | egrep "apt|dpkg"'
             return 1
         fi
     done
@@ -1031,18 +1031,11 @@ setup_docker() {
         success "Docker уже установлен ($(docker --version 2>/dev/null || true))"
     else
         info "Ждём освобождения apt-блокировки..."
-        local waited=0
-        while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock &>/dev/null 2>&1; do
-            sleep 2
-            waited=$((waited + 2))
-            if [[ $waited -ge 120 ]]; then
-                warn "apt занят больше 2 минут — снимаем блокировку принудительно"
-                rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock
-                dpkg --configure -a 2>/dev/null || true
-                break
-            fi
-            info "apt занят (${waited}с)..."
-        done
+        if ! wait_for_apt; then
+            error 'apt/dpkg занят слишком долго — установка Docker отменена'
+            INSTALL_REMNAWAVE=false
+            return 0
+        fi
 
         info "Устанавливаем Docker..."
         set +e
