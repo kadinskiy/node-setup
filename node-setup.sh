@@ -263,30 +263,30 @@ build_rules_for_values() {
 }
 
 prompt_port_ip_proto() {
-    local port_var="$1" ip_var="$2" proto_var="$3"
-    local port src_ip proto
+    local -n port_ref="$1" ip_ref="$2" proto_ref="$3"
+    local tmp_port tmp_src_ip tmp_proto
 
     while true; do
-        port=$(ask "Порт")
-        if validate_port "$port"; then break; fi
+        tmp_port=$(ask "Порт")
+        if validate_port "$tmp_port"; then break; fi
         error "Некорректный порт (1–65535)."
     done
 
-    src_ip=$(ask "Источник: IP, CIDR или Enter = любой")
-    if [[ -n "$src_ip" ]] && ! validate_ip "$src_ip"; then
+    tmp_src_ip=$(ask "Источник: IP, CIDR или Enter = любой")
+    if [[ -n "$tmp_src_ip" ]] && ! validate_ip "$tmp_src_ip"; then
         warn "Некорректный IP/CIDR — будет использован режим 'любой'."
-        src_ip=""
+        tmp_src_ip=""
     fi
 
-    proto=$(ask "Протокол" "both")
-    case "$proto" in
+    tmp_proto=$(ask "Протокол" "both")
+    case "$tmp_proto" in
         tcp|udp|both) ;;
-        *) warn "Неизвестный протокол, используем both"; proto="both" ;;
+        *) warn "Неизвестный протокол, используем both"; tmp_proto="both" ;;
     esac
 
-    printf -v "$port_var" '%s' "$port"
-    printf -v "$ip_var" '%s' "$src_ip"
-    printf -v "$proto_var" '%s' "$proto"
+    port_ref="$tmp_port"
+    ip_ref="$tmp_src_ip"
+    proto_ref="$tmp_proto"
 }
 
 # ════════════════════════════════════════════════════════════
